@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "gateway",
+    "kms",
+    "sessions",
+    "indexer",
+    "engine",
+    "ws-metrics",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Liquifier Team"]
+license     = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio            = { version = "1", features = ["full"] }
+tokio-stream     = "0.1"
+
+# Web framework
+axum             = { version = "0.7", features = ["ws", "macros"] }
+tower            = "0.4"
+tower-http       = { version = "0.5", features = ["cors", "trace"] }
+
+# gRPC
+tonic            = { version = "0.11", features = ["transport", "tls"] }
+tonic-build      = "0.11"
+prost            = "0.12"
+
+# Web3 / EVM
+alloy            = { version = "0.3", features = [
+                        "full",
+                        "signer-local",
+                        "provider-ws",
+                        "rpc-types",
+                        "contract",
+                    ] }
+
+# Database
+sqlx             = { version = "0.7", features = [
+                        "runtime-tokio-rustls",
+                        "postgres",
+                        "uuid",
+                        "json",
+                        "chrono",
+                        "bigdecimal",
+                    ] }
+
+# Redis
+redis            = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+
+# Kafka
+rdkafka          = { version = "0.36", features = ["cmake-build"] }
+
+# Auth / Crypto
+argon2           = "0.5"
+totp-rs          = { version = "5", features = ["gen_secret", "qr"] }
+aes-gcm          = "0.10"
+rand             = "0.8"
+base64           = "0.22"
+
+# JWT
+jsonwebtoken     = "9"
+
+# Serialization
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+
+# Utilities
+uuid             = { version = "1", features = ["v4", "serde"] }
+chrono           = { version = "0.4", features = ["serde"] }
+thiserror        = "1"
+anyhow           = "1"
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy          = "0.15"
+bigdecimal       = { version = "0.4", features = ["serde"] }
+hex              = "0.4"

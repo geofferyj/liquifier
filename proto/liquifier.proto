@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package liquifier;
+
+// ─── Common types ──────────────────────────────────────────────────────────
+
+message Empty {}
+
+// ─── Wallet KMS Service ────────────────────────────────────────────────────
+
+service WalletKms {
+    // Generate a new EVM wallet for a user; returns the public address.
+    rpc GenerateWallet    (GenerateWalletRequest)    returns (GenerateWalletResponse);
+    // Return the checksummed EVM address for a given wallet ID.
+    rpc GetAddress        (GetAddressRequest)        returns (GetAddressResponse);
+    // Return native and ERC-20 token balances.
+    rpc GetBalances       (GetBalancesRequest)       returns (GetBalancesResponse);
+    // Sign an EVM transaction; private key is only decrypted in-memory.
+    rpc SignTransaction    (SignTransactionRequest)   returns (SignTransactionResponse);
+}
+
+message GenerateWalletRequest {
+    string user_id = 1;
+    string label   = 2;
+}
+
+message GenerateWalletResponse {
+    string wallet_id = 1;
+    string address   = 2;
+}
+
+message GetAddressRequest {
+    string wallet_id = 1;
+}
+
+message GetAddressResponse {
+    string address = 1;
+}
+
+message GetBalancesRequest {
+    string wallet_id      = 1;
+    string chain_rpc_url  = 2;
+    repeated string token_addresses = 3;   // ERC-20 contract addresses to query
+}
+
+message TokenBalance {
+    string token_address = 1;  // "native" for native gas token
+    string balance_raw   = 2;  // U256 as decimal string
+    string decimals      = 3;
+    string symbol        = 4;
+}
+
+message GetBalancesResponse {
+    repeated TokenBalance balances = 1;
+}
+
+message SignTransactionRequest {
+    string wallet_id   = 1;
+    uint64 chain_id    = 2;
+    string to          = 3;   // destination address
+    string value       = 4;   // ETH value in wei (decimal string)
+    bytes  data        = 5;   // calldata
+    string gas_limit   = 6;   // decimal string
+    string max_fee_per_gas          = 7;
+    string max_priority_fee_per_gas = 8;
+    string nonce       = 9;
+}
+
+message SignTransactionResponse {
+    bytes  raw_tx   = 1;   // RLP-encoded signed transaction
+    string tx_hash  = 2;   // keccak256 hash of raw_tx
+}
+
+// ─── Session Service ───────────────────────────────────────────────────────
+
+service SessionService {
+    rpc GetSessionConfig   (GetSessionConfigRequest)   returns (GetSessionConfigResponse);
+    rpc ListActiveSessions (ListActiveSessionsRequest) returns (ListActiveSessionsResponse);
+    rpc UpdateSessionState (UpdateSessionStateRequest) returns (UpdateSessionStateResponse);
+}
+
+message GetSessionConfigRequest {
+    string session_id = 1;
+}
+
+message SwapPath {
+    repeated string tokens    = 1;  // ordered list of token addresses
+    repeated string pools     = 2;  // corresponding pool addresses
+    string          fee_bps   = 3;  // total fee in basis points
+    string          liquidity = 4;  // approximate USD liquidity
+}
+
+message SessionConfig {
+    string   session_id              = 1;
+    string   wallet_id               = 2;
+    string   wallet_address          = 3;
+    uint64   chain_id                = 4;
+    string   token_address           = 5;
+    string   target_token_address    = 6;
+    string   total_amount            = 7;   // U256 decimal
+    string   amount_sold             = 8;
+    string   strategy                = 9;   // "pov" | "price_impact"
+    double   pov_percentage          = 10;
+    uint32   max_price_impact_bps    = 11;
+    string   min_buy_trigger_usd     = 12;
+    repeated SwapPath swap_paths     = 13;
+    string   status                  = 14;
+}
+
+message GetSessionConfigResponse {
+    SessionConfig config = 1;
+}
+
+message ListActiveSessionsRequest {
+    uint64 chain_id = 1;
+}
+
+message ListActiveSessionsResponse {
+    repeated SessionConfig sessions = 1;
+}
+
+message UpdateSessionStateRequest {
+    string session_id   = 1;
+    string new_status   = 2;   // "active" | "paused" | "completed" | "failed"
+    string amount_delta = 3;   // additional amount sold this update (U256 decimal)
+}
+
+message UpdateSessionStateResponse {
+    bool   success = 1;
+    string message = 2;
+}

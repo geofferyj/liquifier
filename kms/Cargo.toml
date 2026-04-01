@@ -1,0 +1,27 @@
+[package]
+name    = "kms"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace        = true
+tokio-stream.workspace = true
+tonic.workspace        = true
+prost.workspace        = true
+sqlx.workspace         = true
+aes-gcm.workspace      = true
+rand.workspace         = true
+base64.workspace       = true
+hex.workspace          = true
+serde.workspace        = true
+serde_json.workspace   = true
+uuid.workspace         = true
+thiserror.workspace    = true
+anyhow.workspace       = true
+tracing.workspace      = true
+tracing-subscriber.workspace = true
+dotenvy.workspace      = true
+alloy.workspace        = true
+
+[build-dependencies]
+tonic-build.workspace  = true
