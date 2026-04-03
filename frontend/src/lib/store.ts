@@ -80,10 +80,12 @@ export const useLiveDataStore = create<LiveDataState>((set) => ({
           trade_id: msg.trade_id,
           session_id: msg.session_id,
           chain: msg.chain,
+          status: msg.status,
           sell_amount: msg.sell_amount,
           received_amount: msg.received_amount,
           tx_hash: msg.tx_hash,
           price_impact_bps: msg.price_impact_bps,
+          failure_reason: msg.failure_reason,
           executed_at: msg.executed_at,
         };
 

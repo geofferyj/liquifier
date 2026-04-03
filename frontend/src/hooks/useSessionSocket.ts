@@ -83,11 +83,18 @@ function normalizeWsMessage(raw: unknown): WsMessage | null {
           : `${value.session_id}-${Date.now()}`,
       session_id: value.session_id,
       chain: typeof value.chain === "string" ? value.chain : "unknown",
+      status: typeof value.status === "string" ? value.status : undefined,
       sell_amount: value.sell_amount,
       received_amount:
         typeof value.received_amount === "string" ? value.received_amount : "0",
       tx_hash: typeof value.tx_hash === "string" ? value.tx_hash : "",
       price_impact_bps: Number.isFinite(parsedImpact) ? parsedImpact : 0,
+      failure_reason:
+        typeof value.failure_reason === "string"
+          ? value.failure_reason
+          : value.failure_reason === null
+            ? null
+            : undefined,
       executed_at:
         typeof value.executed_at === "string"
           ? value.executed_at
@@ -115,6 +122,7 @@ function normalizeWsMessage(raw: unknown): WsMessage | null {
           : `${value.session_id}-${Date.now()}`,
       session_id: value.session_id,
       chain: typeof value.chain === "string" ? value.chain : "unknown",
+      status: typeof value.status === "string" ? value.status : undefined,
       sell_amount: value.sell_amount,
       received_amount:
         typeof value.received_amount === "string" ? value.received_amount : "0",
@@ -125,6 +133,12 @@ function normalizeWsMessage(raw: unknown): WsMessage | null {
             ? value.trigger_tx
             : "",
       price_impact_bps: Number.isFinite(parsedImpact) ? parsedImpact : 0,
+      failure_reason:
+        typeof value.failure_reason === "string"
+          ? value.failure_reason
+          : value.failure_reason === null
+            ? null
+            : undefined,
       executed_at:
         typeof value.executed_at === "string"
           ? value.executed_at

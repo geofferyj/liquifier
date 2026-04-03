@@ -55,6 +55,20 @@ impl SessionService for SessionServiceImpl {
             .map_err(|_| Status::invalid_argument("Invalid wallet_id"))?;
         let session_id = Uuid::new_v4();
 
+        if req.pools.is_empty() {
+            return Err(Status::invalid_argument(
+                "At least one pool with a valid swap_path_json is required",
+            ));
+        }
+
+        let mut parsed_pool_paths = Vec::with_capacity(req.pools.len());
+        for pool in &req.pools {
+            parsed_pool_paths.push(parse_pool_swap_path_json(
+                &pool.swap_path_json,
+                &pool.pool_address,
+            )?);
+        }
+
         // Generate a random public slug
         let slug: String = {
             let mut rng = rand::rng();
@@ -108,12 +122,7 @@ impl SessionService for SessionServiceImpl {
         let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
 
         // Persist discovered pools
-        for pool in &req.pools {
-            let swap_path_val: Option<serde_json::Value> = if pool.swap_path_json.is_empty() {
-                None
-            } else {
-                serde_json::from_str(&pool.swap_path_json).ok()
-            };
+        for (pool, swap_path_val) in req.pools.iter().zip(parsed_pool_paths.iter()) {
             sqlx::query(
                 r#"
                 INSERT INTO session_pools (session_id, pool_address, pool_type, dex_name, token0, token1, fee_tier, swap_path)
@@ -596,6 +605,50 @@ impl SessionService for SessionServiceImpl {
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
+
+fn parse_pool_swap_path_json(path: &str, pool_address: &str) -> Result<serde_json::Value, Status> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(
+            "Pool swap_path_json is required for every selected pool",
+        ));
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+        .map_err(|_| Status::invalid_argument("Invalid pool swap_path_json"))?;
+
+    let hops = value
+        .get("hops")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Status::invalid_argument("Pool route must include hops"))?;
+    if hops.is_empty() {
+        return Err(Status::invalid_argument(
+            "Pool route must include at least one hop",
+        ));
+    }
+
+    let first_hop = hops
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Status::invalid_argument("Pool route first hop must be a string"))?;
+    if !first_hop.eq_ignore_ascii_case(pool_address) {
+        return Err(Status::invalid_argument(
+            "Pool route first hop must match pool_address",
+        ));
+    }
+
+    let hop_tokens = value
+        .get("hop_tokens")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Status::invalid_argument("Pool route must include hop_tokens"))?;
+    if hop_tokens.len() != hops.len().saturating_add(1) {
+        return Err(Status::invalid_argument(
+            "Pool route hop_tokens length must equal hops length + 1",
+        ));
+    }
+
+    Ok(value)
+}
 
 async fn fetch_session(db: &PgPool, session_id: Uuid) -> Result<Option<SessionInfo>, sqlx::Error> {
     let row = sqlx::query(

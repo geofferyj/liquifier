@@ -57,7 +57,7 @@ Liquifier is a DeFi execution platform that automates "Percentage of Volume" (PO
 
 ## 2. Database Schema
 
-Defined in `migrations/init.sql` and `migrations/002_session_pools.sql`.
+Defined in `migrations/20260101000000_init.sql` and follow-up migrations (notably `migrations/20260101000005_trades_idempotency_status.sql` for idempotency/status diagnostics).
 
 ### Enums
 
@@ -77,9 +77,9 @@ pool_type:      'v2' | 'v3'
 
 **`sessions`** — Liquidation campaigns. Fields: `id` (UUID), `user_id`, `wallet_id` (FK→wallets), `chain`, `status`, `sell_token`/`target_token` addresses + symbols + decimals, `strategy` ('pov'), `total_amount` (NUMERIC(78,0) for full U256 range), `amount_sold`, `pov_percent` (e.g. 10.00), `max_price_impact` (e.g. 1.00%), `min_buy_trigger_usd`, `swap_path` (JSONB), `public_slug` (for shareable links), timestamps. Indexed on `(chain, sell_token) WHERE status = 'active'` for the hot-path query.
 
-**`session_pools`** — DEX pools watched per session. Fields: `id`, `session_id` (FK→sessions), `pool_address`, `pool_type` (v2/v3), `dex_name`, `token0`, `token1`, `fee_tier` (bps for v3, 0 for v2). Unique on `(session_id, pool_address)`.
+**`session_pools`** — DEX pools watched per session. Fields: `id`, `session_id` (FK→sessions), `pool_address`, `pool_type` (v2/v3), `dex_name`, `token0`, `token1`, `fee_tier` (bps for v3, 0 for v2), `swap_path` (JSONB route payload used by execution). Unique on `(session_id, pool_address)`.
 
-**`trades`** — Individual trade executions. Fields: `id`, `session_id`, `chain`, `status`, trigger info (`trigger_tx_hash`, `trigger_pool`, `trigger_buy_amount`), execution info (`sell_amount`, `sell_tx_hash`, `sell_pool`, `price_impact_bps`), routing info (`route_tx_hash`, `final_received`, `final_token`), gas info, timestamps.
+**`trades`** — Individual trade executions. Fields: `id`, `session_id`, `chain`, `status`, trigger info (`trigger_tx_hash`, `trigger_pool`, `trigger_log_index`, `trigger_buy_amount`), execution info (`sell_amount`, `sell_tx_hash`, `sell_pool`, `price_impact_bps`), lifecycle diagnostics (`failure_reason`), routing info (`route_tx_hash`, `final_received`, `final_token`), gas info, timestamps.
 
 **`audit_log`** — Append-only security events. Fields: `id` (BIGSERIAL), `user_id`, `action`, `metadata` (JSONB), `ip_address` (INET), `created_at`.
 
@@ -121,7 +121,7 @@ pool_type:      'v2' | 'v3'
 - Topics layout: `[event_sig, sender(indexed), to(indexed)]`
 - Data layout: 4 × 32-byte words = `[amount0In, amount1In, amount0Out, amount1Out]`
 - Direction detection: If `amount0In > 0`, then token0 is the input token and `amount1Out` is the output. Otherwise, `amount1In` is input and `amount0Out` is output.
-- **Note**: `token_in` and `token_out` addresses are left as empty strings. The indexer does not resolve which token is token0/token1 — that mapping is deferred to the execution engine and session matching.
+- After parsing, the indexer resolves pool `token0`/`token1` on-chain and sets concrete `token_in`/`token_out` addresses before publishing the event to NATS.
 
 **V3 Parsing (`parse_v3_swap`)**:
 - Topics layout: `[event_sig, sender(indexed), recipient(indexed)]`
@@ -138,8 +138,8 @@ DexSwapEvent {
     log_index: u32,
     pool_address: String,   // contract that emitted the Swap event
     dex_type: String,       // "uniswap_v2" or "uniswap_v3"
-    token_in: String,       // empty — not resolved by indexer
-    token_out: String,      // empty — not resolved by indexer
+      token_in: String,       // resolved from pool token0/token1 + swap direction
+      token_out: String,      // resolved from pool token0/token1 + swap direction
     amount_in: String,      // U256 decimal string
     amount_out: String,     // U256 decimal string
     sender: String,
@@ -228,11 +228,13 @@ sell_amount = min(sell_amount, remaining)
 ```
 If remaining is zero, skip. TODO(add session completion logic when total_amount is fully sold).
 
-**2c. Price Impact Calculation:- TODO(add v3 integration)**
+**2c. Price Impact Calculation**
 
-Calls `impact::calculate_price_impact_v2(pool_address, sell_amount)`.
+Calls `impact::calculate_price_impact(chain, pool_address, pool_type, sell_token, sell_amount)`.
 
-The current implementation uses **placeholder reserves** (1M and 500K tokens). In production, this would call the pool's `getReserves()` on-chain.
+Current implementation uses live on-chain reads:
+- V2 pools: calls `getReserves()` and applies constant-product impact math.
+- V3 pools: approximates available depth from on-chain pool token balances.
 
 The formula for constant-product AMM (x × y = k):
 ```
@@ -240,11 +242,20 @@ price_impact_bps = sell_amount × 10,000 / (reserve_x + sell_amount)
 ```
 This is the price impact in basis points (1 bps = 0.01%).
 
-If `price_impact_bps > session.max_price_impact × 100`, the trade is skipped with a warning log.
+If `price_impact_bps > min(session.max_price_impact × 100, global_max_price_impact_bps)`, the trade is skipped with a warning log.
 
 **2d. Transaction Construction**
 
-Calls `build_swap_calldata(pool_address, sell_amount)` — currently a **placeholder** that produces a dummy 36-byte payload (4-byte selector + 32-byte amount). Production would ABI-encode a proper DEX router `swap()` call.
+Calls `build_swap_calldata(router_address, sell_amount, route, pool_type, fee_tier)`.
+
+Current behavior:
+- V2 pools: ABI-encodes router `swapExactTokensForTokens(amountIn, amountOutMin, path, to, deadline)` using route `hop_tokens`.
+- V3 pools: ABI-encodes router `exactInput(params)` with an encoded token/fee path.
+
+Remaining production hardening:
+- set real recipient wallet address (currently placeholder recipient)
+- set non-zero slippage bounds (`amountOutMin` / `amountOutMinimum`)
+- wrap calldata into a full unsigned transaction envelope before signing/submission
 
 **2e. Transaction Signing via KMS**
 
@@ -268,24 +279,21 @@ Inserts into the `trades` table:
 ```sql
 INSERT INTO trades (
     session_id, chain, status, trigger_tx_hash, trigger_pool,
-    trigger_buy_amount, sell_amount, sell_pool, price_impact_bps, executed_at
+   trigger_log_index, trigger_buy_amount, sell_amount, sell_tx_hash,
+   sell_pool, price_impact_bps, executed_at
 )
-VALUES ($1, $2::chain_id, 'confirmed', $3, $4, $5, $6, $7, $8, NOW())
+VALUES ($1, $2::chain_id, 'submitted', $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+ON CONFLICT (session_id, trigger_tx_hash, trigger_pool, trigger_log_index) DO NOTHING
 ```
 
-Updates the session's cumulative sold amount:
+If a row is newly inserted (non-duplicate trigger), updates the session's cumulative sold amount:
 ```sql
 UPDATE sessions SET amount_sold = amount_sold + $1 WHERE id = $2
 ```
 
-**2h. Async Routing (if needed)**
+**2h. Routing is handled by the primary execution path**
 
-Checks `needs_routing(session, event)` — returns `true` if `event.token_in` (the token received from the pool swap) does not match `session.target_token`. If routing is needed, spawns `router::route_to_target_token(db, session_id)` in a background task.
-
-**Routing Flow** (`router.rs`):
-1. Queries trades with `status = 'confirmed'` and `route_tx_hash IS NULL` for the session.
-2. For each pending trade, marks it as `status = 'routing'`, `route_tx_hash = 'pending_routing'`.
-3. Production would: determine the intermediate token, find the best route to the target token via a DEX aggregator, build and sign the swap, submit, await confirmation, and update the trade with the final `route_tx_hash` and `final_received`.
+The execution engine no longer spawns a separate async intermediate-routing step after recording a trade. Route selection/execution is expected to be handled in the primary router call path for the trade.
 
 **2i. Publish Trade Completion to NATS**
 
@@ -293,11 +301,15 @@ Publishes a JSON event to subject `trades.completed`:
 ```json
 {
     "session_id": "...",
+      "trade_id": "...",
     "chain": "ethereum",
     "sell_amount": "100000000000000000",
+      "received_amount": "50000000",
+      "tx_hash": "0x...",
     "price_impact_bps": 15,
-    "pool": "0x...",
-    "trigger_tx": "0x..."
+      "status": "submitted",
+      "failure_reason": null,
+      "executed_at": "2026-04-02T12:00:00Z"
 }
 ```
 This is consumed by the WebSocket Service for real-time client updates.
@@ -316,13 +328,14 @@ A gRPC server on port 50052 implementing the `SessionService` protobuf service.
 
 1. Generates a UUID session ID and a 12-character random alphanumeric `public_slug`.
 2. Inserts into `sessions` table with all token config, strategy params, and initial `status = 'pending'`, `amount_sold = 0`.
-3. For each `PoolInfo` in the request's `pools` field, inserts into `session_pools`:
+3. Requires at least one pool and validates every pool `swap_path_json` (non-empty JSON route, first hop matches the pool, and hop-token length is consistent).
+4. For each `PoolInfo` in the request's `pools` field, inserts into `session_pools`:
    ```sql
-   INSERT INTO session_pools (session_id, pool_address, pool_type, dex_name, token0, token1, fee_tier)
-   VALUES ($1, $2, $3::pool_type, $4, $5, $6, $7)
+   INSERT INTO session_pools (session_id, pool_address, pool_type, dex_name, token0, token1, fee_tier, swap_path)
+   VALUES ($1, $2, $3::pool_type, $4, $5, $6, $7, $8)
    ON CONFLICT (session_id, pool_address) DO NOTHING
    ```
-4. Returns the full `SessionInfo` including the generated slug and timestamps.
+5. Returns the full `SessionInfo` including the generated slug and timestamps.
 
 **`GetSession(GetSessionRequest) → SessionInfo`**
 
@@ -343,13 +356,25 @@ Returns the updated session.
 **`GetActiveSessionsForToken(ActiveSessionsQuery) → ActiveSessionsResponse`**
 
 The hot-path query used by the Execution Engine on every swap event:
+- If `pool_address` is set, joins `session_pools` and matches active sessions watching that pool.
+- Otherwise, falls back to `(chain, sell_token)` lookup.
+
+Pool-address path (used by execution-engine):
 ```sql
-SELECT ... FROM sessions
+SELECT DISTINCT s.*
+FROM sessions s
+INNER JOIN session_pools sp ON sp.session_id = s.id
+WHERE s.chain = $1::chain_id
+  AND s.status = 'active'
+  AND LOWER(sp.pool_address) = LOWER($2)
+```
+Fallback token-address path:
+```sql
+SELECT * FROM sessions
 WHERE chain = $1::chain_id
   AND sell_token = $2
   AND status = 'active'
 ```
-Where `$1` is the chain name (e.g. "ethereum") cast to the `chain_id` enum, and `$2` is the token address. This query hits the partial index `idx_sessions_chain_sell ON sessions (chain, sell_token) WHERE status = 'active'`.
 
 For each matching session, also fetches its pools from `session_pools` and attaches them to the response.
 
@@ -433,7 +458,9 @@ Fetches all wallets for a user, ordered by creation time. Returns public info on
 
 **`GetBalance(GetBalanceRequest) → GetBalanceResponse`**
 
-Currently a **placeholder** returning `balance: "0", decimals: 18`. Production would create an alloy HTTP provider and call the ERC-20 `balanceOf()` or fetch native balance.
+Resolves an RPC URL (request override or chain config), looks up the wallet address, then:
+- If `token_address` is empty/native placeholder: returns native coin balance via provider `get_balance(address)` with `decimals = 18`.
+- If `token_address` is set: calls ERC-20 `decimals()` and `balanceOf(address)` and returns exact token balance/decimals.
 
 **`SignTransaction(SignTransactionRequest) → SignTransactionResponse`**
 
@@ -487,7 +514,7 @@ Both are HMAC-SHA256 JWTs signed with the `JWT_SECRET` environment variable. Cla
 - `POST /api/v1/wallets` — Proxies to `KMS::CreateWallet`. Body: `{ chain: "ethereum" }`.
 - `GET /api/v1/wallets` — Proxies to `KMS::ListWallets`.
 - `GET /api/v1/wallets/{wallet_id}/balance` — Proxies to `KMS::GetBalance`.
-- `POST /api/v1/sessions` — Proxies to `SessionService::CreateSession`. Accepts full session config including optional `pools[]` array.
+- `POST /api/v1/sessions` — Proxies to `SessionService::CreateSession`. Requires `pools[]` with valid per-pool `swap_path_json` routes.
 - `GET /api/v1/sessions` — Proxies to `SessionService::ListSessions`.
 - `GET /api/v1/sessions/{session_id}` — Proxies to `SessionService::GetSession`.
 - `PUT /api/v1/sessions/{session_id}/status` — Proxies to `SessionService::UpdateSessionStatus`. Validates status is one of `active`, `paused`, `cancelled`.
@@ -603,13 +630,15 @@ This traces the exact path from user action to database state.
 
 7. **API Gateway** (`routes::create_session`):
    - Validates JWT, extracts `user_id`.
+   - Validates every selected pool has a valid `swap_path_json` route payload.
    - Converts `PoolInfoBody[]` to protobuf `PoolInfo[]`.
    - Calls `SessionServiceClient::create_session(CreateSessionRequest { ... })`.
 
 8. **Session API** (`SessionServiceImpl::create_session`):
    - Generates UUID `session_id` and 12-char `public_slug`.
    - Inserts into `sessions` table with `status = 'pending'`.
-   - For each pool, inserts into `session_pools` with `ON CONFLICT DO NOTHING`.
+   - Re-validates per-pool route payloads.
+   - For each pool, inserts into `session_pools` (including `swap_path`) with `ON CONFLICT DO NOTHING`.
    - Returns `SessionInfo`.
 
 9. **Frontend** receives the session. User activates it.
@@ -629,21 +658,21 @@ This traces the exact path from an on-chain event to a recorded trade.
 2. **Indexer** receives the log via WebSocket subscription:
    - `parse_v3_swap()` extracts: `sender`, `recipient`, signed `amount0` and `amount1`.
    - Determines `amount_in` and `amount_out` from sign bits.
+   - Resolves pool `token0`/`token1` and assigns `token_in`/`token_out` based on swap direction.
    - Creates `DexSwapEvent { chain: "ethereum", pool_address: "0xPOOL", dex_type: "uniswap_v3", amount_in: "...", amount_out: "...", ... }`.
    - Publishes JSON to NATS subject `evm.dex.swaps`.
 
 3. **NATS JetStream** delivers the message to exactly one Execution Engine replica (WorkQueue retention, durable consumer `"execution-engine"`).
 
 4. **Execution Engine** (`process_swap_event`):
-   - Acks the message immediately.
    - Calls Session API: `get_active_sessions_for_token({ chain: "ethereum", pool_address: "0xPOOL" })`.
    - The session-api JOINs `session_pools` to find all active sessions watching `0xPOOL`.
    - Assuming a matching active session `S` is returned:
      - Min trigger: `amount_out >= session.min_buy_trigger_usd × 10^18` (simplified)
      - Sell amount: `sell_amount = amount_out × (pov_percent × 100) / 10000`
      - Remaining check: `remaining = total_amount - amount_sold > 0`
-     - Price impact: `calculate_price_impact_v2("0xPOOL", sell_amount)` → returns bps using placeholder reserves
-     - If impact ≤ max: builds tx calldata (placeholder), calls KMS to sign.
+       - Price impact: `calculate_price_impact(chain, pool, pool_type, sell_token, sell_amount)` using on-chain data
+       - If impact ≤ effective max (session/global cap): builds ABI calldata, calls KMS to sign.
 
 5. **KMS** (`sign_transaction`):
    - Fetches encrypted private key for `session.wallet_id`.
@@ -654,10 +683,10 @@ This traces the exact path from an on-chain event to a recorded trade.
 
 6. **Execution Engine** continues:
    - (Placeholder: submits transaction on-chain)
-   - Records trade in `trades` table with `status = 'confirmed'`.
-   - Updates `sessions.amount_sold += sell_amount`.
-   - If routing needed (intermediate ≠ target token): spawns `router::route_to_target_token()`.
-   - Publishes JSON to NATS subject `trades.completed`.
+   - Records trade in `trades` table with `status = 'submitted'` and trigger idempotency key (`trigger_tx_hash`, `trigger_pool`, `trigger_log_index`).
+   - If the trigger is new, updates `sessions.amount_sold += sell_amount`; duplicates are short-circuited.
+   - Attempts receipt lookup and finalizes to `confirmed`/`failed` when outcome is available (otherwise remains `submitted`).
+   - Publishes JSON to NATS subject `trades.completed` including `status` and `failure_reason`.
 
 7. **NATS** delivers to the `TRADES_COMPLETED` stream.
 

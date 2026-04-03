@@ -1,37 +1,124 @@
-use alloy::primitives::U256;
+use alloy::{
+    primitives::{Address, U256},
+    providers::ProviderBuilder,
+    sol,
+};
+use anyhow::{Context, Result};
+use common::types::PoolType;
 
-/// Calculate price impact for a Uniswap V2-style constant product pool.
+sol! {
+    #[sol(rpc)]
+    interface IUniswapV2Pair {
+        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV3Pool {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface IERC20 {
+        function balanceOf(address account) external view returns (uint256);
+    }
+}
+
+/// Calculate price impact from live on-chain pool balances/reserves.
 ///
-/// Uses the x * y = k formula:
-///   - Given reserves (x, y) and sell amount Δx
-///   - Output Δy = (y * Δx) / (x + Δx)
-///   - Price impact = 1 - (Δy / Δx) / (y / x)
-///     = Δx / (x + Δx)  (simplified)
-///
-/// Returns price impact in basis points (1 bps = 0.01%).
-pub async fn calculate_price_impact_v2(
-    _pool_address: &str,
+/// Uses a constant-product approximation:
+///   price_impact_bps = (sell_amount * 10000) / (reserve_x + sell_amount)
+/// where `reserve_x` is the pool-side reserve/balance of the sell token.
+pub async fn calculate_price_impact(
+    chain: &str,
+    pool_address: &str,
+    pool_type: PoolType,
+    sell_token: &str,
     sell_amount: U256,
-) -> u32 {
-    // In production, fetch actual reserves from the pool contract:
-    //   let (reserve_x, reserve_y) = pool.getReserves().call().await;
-    //
-    // Placeholder reserves for scaffolding — production reads on-chain
-    let reserve_x = U256::from(1_000_000u64) * U256::from(10u64).pow(U256::from(18u64)); // 1M tokens
-    let reserve_y = U256::from(500_000u64) * U256::from(10u64).pow(U256::from(18u64));   // 500K tokens
+) -> Result<u32> {
+    let settings = liquifier_config::Settings::global();
+    let chain_cfg = settings
+        .chains
+        .get(chain)
+        .with_context(|| format!("Missing chain config for {chain}"))?;
+    let rpc_url = chain_cfg.rpc_url.trim();
+    if rpc_url.is_empty() {
+        anyhow::bail!("Missing rpc_url for chain {chain}");
+    }
 
-    calculate_impact_from_reserves(reserve_x, reserve_y, sell_amount)
+    let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
+        .parse()
+        .with_context(|| format!("Invalid rpc_url configured for {chain}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+    let pool: Address = pool_address
+        .parse()
+        .with_context(|| format!("Invalid pool address: {pool_address}"))?;
+    let sell: Address = sell_token
+        .parse()
+        .with_context(|| format!("Invalid sell token address: {sell_token}"))?;
+
+    let (token0, token1, reserve0, reserve1) = match pool_type {
+        PoolType::V2 => {
+            let pair = IUniswapV2Pair::new(pool, &provider);
+            let token0 = Address::from(pair.token0().call().await?.0);
+            let token1 = Address::from(pair.token1().call().await?.0);
+            let reserves = pair.getReserves().call().await?;
+            let reserve0 =
+                U256::from_str_radix(&reserves.reserve0.to_string(), 10).unwrap_or(U256::ZERO);
+            let reserve1 =
+                U256::from_str_radix(&reserves.reserve1.to_string(), 10).unwrap_or(U256::ZERO);
+            (token0, token1, reserve0, reserve1)
+        }
+        PoolType::V3 => {
+            let pool_contract = IUniswapV3Pool::new(pool, &provider);
+            let token0 = Address::from(pool_contract.token0().call().await?.0);
+            let token1 = Address::from(pool_contract.token1().call().await?.0);
+
+            let erc20_0 = IERC20::new(token0, &provider);
+            let erc20_1 = IERC20::new(token1, &provider);
+
+            let reserve0 = erc20_0
+                .balanceOf(pool)
+                .call()
+                .await
+                .context("Failed to read V3 token0 balance")?;
+            let reserve1 = erc20_1
+                .balanceOf(pool)
+                .call()
+                .await
+                .context("Failed to read V3 token1 balance")?;
+            (token0, token1, reserve0, reserve1)
+        }
+    };
+
+    let (reserve_x, reserve_y) = if sell == token0 {
+        (reserve0, reserve1)
+    } else if sell == token1 {
+        (reserve1, reserve0)
+    } else {
+        anyhow::bail!(
+            "Sell token {} does not match pool tokens {} / {}",
+            sell,
+            token0,
+            token1
+        );
+    };
+
+    Ok(calculate_impact_from_reserves(
+        reserve_x,
+        reserve_y,
+        sell_amount,
+    ))
 }
 
 /// Pure calculation: price impact in basis points from reserves.
 ///
 /// For constant-product AMM (x * y = k):
 ///   price_impact_bps = (sell_amount * 10000) / (reserve_x + sell_amount)
-pub fn calculate_impact_from_reserves(
-    reserve_x: U256,
-    reserve_y: U256,
-    sell_amount: U256,
-) -> u32 {
+pub fn calculate_impact_from_reserves(reserve_x: U256, reserve_y: U256, sell_amount: U256) -> u32 {
     if reserve_x.is_zero() || reserve_y.is_zero() || sell_amount.is_zero() {
         return 0;
     }
@@ -82,7 +169,10 @@ mod tests {
             U256::from(500_000u64),
             U256::from(100_000u64),
         );
-        assert!(impact > 800 && impact < 1000, "Expected ~909 bps, got {impact}");
+        assert!(
+            impact > 800 && impact < 1000,
+            "Expected ~909 bps, got {impact}"
+        );
     }
 
     #[test]

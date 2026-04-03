@@ -718,6 +718,38 @@ pub async fn create_session(
     let chain = body.chain.clone();
     let sell_token = normalize_token_for_chain(&chain, &body.sell_token);
     let target_token = normalize_token_for_chain(&chain, &body.target_token);
+    let pools = body.pools.unwrap_or_default();
+
+    if pools.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if pools
+        .iter()
+        .any(|p| !validate_pool_swap_path_json(&p.swap_path_json, &p.pool_address))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let grpc_pools: Vec<PoolInfo> = pools
+        .into_iter()
+        .map(|p| PoolInfo {
+            pool_address: p.pool_address,
+            pool_type: p.pool_type,
+            dex_name: p.dex_name,
+            token0: normalize_token_for_chain(&chain, &p.token0),
+            token1: normalize_token_for_chain(&chain, &p.token1),
+            fee_tier: p.fee_tier,
+            reserve0: p.reserve0,
+            reserve1: p.reserve1,
+            liquidity: p.liquidity,
+            balance0: p.balance0,
+            balance1: p.balance1,
+            token0_price_usd: p.token0_price_usd,
+            token1_price_usd: p.token1_price_usd,
+            swap_path_json: p.swap_path_json,
+        })
+        .collect();
 
     let resp = client
         .create_session(CreateSessionRequest {
@@ -736,27 +768,7 @@ pub async fn create_session(
             max_price_impact: body.max_price_impact,
             min_buy_trigger_usd: body.min_buy_trigger_usd,
             swap_path_json: body.swap_path_json.unwrap_or_default(),
-            pools: body
-                .pools
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| PoolInfo {
-                    pool_address: p.pool_address,
-                    pool_type: p.pool_type,
-                    dex_name: p.dex_name,
-                    token0: normalize_token_for_chain(&chain, &p.token0),
-                    token1: normalize_token_for_chain(&chain, &p.token1),
-                    fee_tier: p.fee_tier,
-                    reserve0: p.reserve0,
-                    reserve1: p.reserve1,
-                    liquidity: p.liquidity,
-                    balance0: p.balance0,
-                    balance1: p.balance1,
-                    token0_price_usd: p.token0_price_usd,
-                    token1_price_usd: p.token1_price_usd,
-                    swap_path_json: p.swap_path_json,
-                })
-                .collect(),
+            pools: grpc_pools,
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -1136,10 +1148,12 @@ pub async fn get_session_trades(
             t.id::text AS trade_id,
             t.session_id::text AS session_id,
             t.chain::text AS chain,
+            t.status::text AS status,
             t.sell_amount::text AS sell_amount,
             COALESCE(t.final_received, t.trigger_buy_amount)::text AS received_amount,
             COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
             COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
+            t.failure_reason AS failure_reason,
             COALESCE(t.executed_at, t.created_at) AS executed_at
         FROM trades t
         INNER JOIN sessions s ON s.id = t.session_id
@@ -1163,10 +1177,12 @@ pub async fn get_session_trades(
                 "trade_id": row.get::<String, _>("trade_id"),
                 "session_id": row.get::<String, _>("session_id"),
                 "chain": row.get::<String, _>("chain"),
+                "status": row.get::<String, _>("status"),
                 "sell_amount": row.get::<String, _>("sell_amount"),
                 "received_amount": row.get::<String, _>("received_amount"),
                 "tx_hash": row.get::<String, _>("tx_hash"),
                 "price_impact_bps": row.get::<i32, _>("price_impact_bps"),
+                "failure_reason": row.get::<Option<String>, _>("failure_reason"),
                 "executed_at": executed_at.to_rfc3339(),
             })
         })
@@ -1188,10 +1204,12 @@ pub async fn get_public_session_trades(
             t.id::text AS trade_id,
             t.session_id::text AS session_id,
             t.chain::text AS chain,
+            t.status::text AS status,
             t.sell_amount::text AS sell_amount,
             COALESCE(t.final_received, t.trigger_buy_amount)::text AS received_amount,
             COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
             COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
+            t.failure_reason AS failure_reason,
             COALESCE(t.executed_at, t.created_at) AS executed_at
         FROM trades t
         INNER JOIN sessions s ON s.id = t.session_id
@@ -1214,10 +1232,12 @@ pub async fn get_public_session_trades(
                 "trade_id": row.get::<String, _>("trade_id"),
                 "session_id": row.get::<String, _>("session_id"),
                 "chain": row.get::<String, _>("chain"),
+                "status": row.get::<String, _>("status"),
                 "sell_amount": row.get::<String, _>("sell_amount"),
                 "received_amount": row.get::<String, _>("received_amount"),
                 "tx_hash": row.get::<String, _>("tx_hash"),
                 "price_impact_bps": row.get::<i32, _>("price_impact_bps"),
+                "failure_reason": row.get::<Option<String>, _>("failure_reason"),
                 "executed_at": executed_at.to_rfc3339(),
             })
         })
@@ -1400,6 +1420,37 @@ async fn erc20_call_uint8(
         return Err(anyhow::anyhow!("Invalid uint8 response"));
     }
     Ok(data[31])
+}
+
+fn validate_pool_swap_path_json(path: &str, pool_address: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+
+    let Some(hops) = value.get("hops").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if hops.is_empty() {
+        return false;
+    }
+
+    let Some(first_hop) = hops.first().and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !first_hop.eq_ignore_ascii_case(pool_address) {
+        return false;
+    }
+
+    let Some(hop_tokens) = value.get("hop_tokens").and_then(|v| v.as_array()) else {
+        return false;
+    };
+
+    hop_tokens.len() == hops.len().saturating_add(1)
 }
 
 // ─────────────────────────────────────────────────────────────

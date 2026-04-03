@@ -1,12 +1,12 @@
 use alloy::{
-    primitives::{address, b256, Address, B256, U256},
+    primitives::{b256, Address, B256, U256},
     providers::{Provider, ProviderBuilder, WsConnect},
     rpc::types::{Filter, Log},
+    sol,
 };
 use anyhow::{Context, Result};
 use common::types::{DexSwapEvent, SUBJECT_DEX_SWAPS};
 use futures::StreamExt;
-use std::str::FromStr;
 use tracing::{error, info, warn};
 
 mod parser;
@@ -22,6 +22,14 @@ const UNISWAP_V2_SWAP_SIG: B256 =
 /// UniswapV3 Swap(address,address,int256,int256,uint160,uint128,int24)
 const UNISWAP_V3_SWAP_SIG: B256 =
     b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+
+sol! {
+    #[sol(rpc)]
+    interface IPoolTokens {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // Chain configuration
@@ -132,7 +140,17 @@ async fn index_chain(
 
     while let Some(log) = stream.next().await {
         match parser::parse_swap_log(chain_name, &log) {
-            Ok(Some(event)) => {
+            Ok(Some(mut event)) => {
+                if let Err(e) = resolve_tokens_for_event(&provider, &log, &mut event).await {
+                    warn!(
+                        chain = %chain_name,
+                        pool = %event.pool_address,
+                        error = %e,
+                        "Failed to resolve token_in/token_out; skipping event"
+                    );
+                    continue;
+                }
+
                 let payload = serde_json::to_vec(&event)?;
                 if let Err(e) = jetstream.publish(SUBJECT_DEX_SWAPS, payload.into()).await {
                     error!(chain = %chain_name, error = %e, "Failed to publish to NATS");
@@ -144,6 +162,53 @@ async fn index_chain(
             Err(e) => {
                 warn!(chain = %chain_name, error = %e, "Failed to parse swap log");
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_tokens_for_event<P: Provider + Clone>(
+    provider: &P,
+    log: &Log,
+    event: &mut DexSwapEvent,
+) -> Result<()> {
+    let pool = log.address();
+    let pool_contract = IPoolTokens::new(pool, provider.clone());
+    let token0 = Address::from(pool_contract.token0().call().await?.0);
+    let token1 = Address::from(pool_contract.token1().call().await?.0);
+
+    let data = log.data().data.as_ref();
+    match event.dex_type.as_str() {
+        "uniswap_v2" => {
+            if data.len() < 128 {
+                anyhow::bail!("V2 swap log data too short");
+            }
+            let amount0_in = U256::from_be_slice(&data[0..32]);
+            if !amount0_in.is_zero() {
+                event.token_in = format!("{token0:?}");
+                event.token_out = format!("{token1:?}");
+            } else {
+                event.token_in = format!("{token1:?}");
+                event.token_out = format!("{token0:?}");
+            }
+        }
+        "uniswap_v3" => {
+            if data.len() < 64 {
+                anyhow::bail!("V3 swap log data too short");
+            }
+            let amount0_raw = U256::from_be_slice(&data[0..32]);
+            let amount0_negative = amount0_raw.bit(255);
+            if !amount0_negative {
+                event.token_in = format!("{token0:?}");
+                event.token_out = format!("{token1:?}");
+            } else {
+                event.token_in = format!("{token1:?}");
+                event.token_out = format!("{token0:?}");
+            }
+        }
+        other => {
+            anyhow::bail!("Unsupported dex_type for token resolution: {other}");
         }
     }
 

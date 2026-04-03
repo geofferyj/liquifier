@@ -108,10 +108,12 @@ export interface Trade {
   trade_id: string;
   session_id: string;
   chain: string;
+  status?: string;
   sell_amount: string;
   received_amount: string;
   tx_hash: string;
   price_impact_bps: number;
+  failure_reason?: string | null;
   executed_at: string;
 }
 
@@ -132,10 +134,12 @@ export interface WsTradeCompleted {
   trade_id: string;
   session_id: string;
   chain: string;
+  status?: string;
   sell_amount: string;
   received_amount: string;
   tx_hash: string;
   price_impact_bps: number;
+  failure_reason?: string | null;
   executed_at: string;
 }
 
