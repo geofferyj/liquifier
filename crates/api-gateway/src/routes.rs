@@ -730,7 +730,7 @@ pub async fn compute_pool_path(
     Extension(_user): Extension<AuthUser>,
     Json(body): Json<ComputePoolPathBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut client = SessionServiceClient::connect(state.session_api_addr.clone())
+    let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 

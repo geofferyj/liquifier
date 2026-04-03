@@ -28,4 +28,5 @@ nats-data/
 reth-api-gateway-plan-backlog.md
 reth-api-gateway-plan.md
 PLACEHOLDERS.md
-.promptfrontend/tsconfig.tsbuildinfo
+.prompt
+frontend/tsconfig.tsbuildinfo
