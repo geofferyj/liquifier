@@ -54,8 +54,11 @@ function VerifyEmailContent() {
             <>
               <div className="text-4xl">✓</div>
               <p className="text-primary">{message}</p>
-              <Link href="/dashboard">
-                <Button>Go to Dashboard</Button>
+              <p className="text-sm text-muted-foreground">
+                Next, you&apos;ll need to set up 2FA to secure your account.
+              </p>
+              <Link href="/login">
+                <Button>Continue to Sign In</Button>
               </Link>
             </>
           )}
@@ -64,8 +67,8 @@ function VerifyEmailContent() {
             <>
               <div className="text-4xl">✗</div>
               <p className="text-destructive">{message}</p>
-              <Link href="/dashboard">
-                <Button variant="secondary">Go to Dashboard</Button>
+              <Link href="/login">
+                <Button variant="secondary">Back to Sign In</Button>
               </Link>
             </>
           )}

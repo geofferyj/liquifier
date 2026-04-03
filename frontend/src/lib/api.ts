@@ -1,5 +1,7 @@
 import type {
   AuthResponse,
+  LoginResponse,
+  SignupResponse,
   PoolInfo,
   Session,
   SwapPath,
@@ -100,12 +102,15 @@ class ApiClient {
 
   // ── Auth ───────────────────────────────────────────────────
 
-  async signup(email: string, password: string): Promise<AuthResponse> {
-    const data = await this.request<AuthResponse>("/api/v1/auth/signup", {
+  async signup(email: string, password: string): Promise<SignupResponse> {
+    const data = await this.request<SignupResponse>("/api/v1/auth/signup", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     });
-    this.setTokens(data.access_token, data.refresh_token);
+    if (data.access_token) {
+      this.accessToken = data.access_token;
+      localStorage.setItem("access_token", data.access_token);
+    }
     return data;
   }
 
@@ -113,12 +118,19 @@ class ApiClient {
     email: string,
     password: string,
     totpCode?: string,
-  ): Promise<AuthResponse> {
-    const data = await this.request<AuthResponse>("/api/v1/auth/login", {
+  ): Promise<LoginResponse> {
+    const data = await this.request<LoginResponse>("/api/v1/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password, totp_code: totpCode }),
     });
-    this.setTokens(data.access_token, data.refresh_token);
+    if (data.access_token) {
+      this.accessToken = data.access_token;
+      localStorage.setItem("access_token", data.access_token);
+    }
+    if (data.refresh_token) {
+      this.refreshToken = data.refresh_token;
+      localStorage.setItem("refresh_token", data.refresh_token);
+    }
     return data;
   }
 
@@ -170,9 +182,11 @@ class ApiClient {
 
   async exportWallet(
     walletId: string,
+    totpCode: string,
   ): Promise<{ private_key: string; address: string }> {
     return this.request(`/api/v1/wallets/${walletId}/export`, {
       method: "POST",
+      body: JSON.stringify({ totp_code: totpCode }),
     });
   }
 

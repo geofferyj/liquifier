@@ -10,6 +10,9 @@ use common::proto::{
     GetSwapPathsRequest, ListSessionsRequest, ListWalletsRequest, PoolInfo,
     TogglePublicSharingRequest, UpdateSessionConfigRequest, UpdateSessionStatusRequest,
 };
+use common::types::{
+    display_token_for_chain, is_native_token_placeholder, normalize_token_for_chain,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use totp_rs::{Algorithm, Secret, TOTP};
@@ -40,6 +43,12 @@ pub struct AuthResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totp_enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +71,11 @@ pub struct TotpVerifyRequest {
 #[derive(Deserialize)]
 pub struct CreateWalletBody {
     pub chain: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ExportWalletBody {
+    pub totp_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -190,7 +204,7 @@ pub async fn list_chains() -> Json<serde_json::Value> {
 pub async fn signup(
     State(state): State<SharedState>,
     Json(body): Json<SignupRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     // Validate email format (basic)
     if !body.email.contains('@') || body.email.len() > 256 {
         return Err(StatusCode::BAD_REQUEST);
@@ -202,41 +216,107 @@ pub async fn signup(
     let password_hash =
         auth::hash_password(&body.password).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
-        .bind(user_id)
-        .bind(&body.email)
-        .bind(&password_hash)
-        .execute(&state.db)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("duplicate key") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+    // Check if user already exists with unverified email
+    let existing =
+        sqlx::query("SELECT id, email_verified, totp_enabled FROM users WHERE email = $1")
+            .bind(&body.email)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(row) = existing {
+        let user_id: Uuid = row.get("id");
+        let email_verified: bool = row.get("email_verified");
+        let totp_enabled: bool = row.get("totp_enabled");
+
+        if !email_verified {
+            // Re-generate verification token for existing unverified user
+            let token = Uuid::new_v4().to_string();
+            let expires = chrono::Utc::now() + chrono::Duration::hours(24);
+            sqlx::query(
+                "UPDATE users SET verification_token = $1, verification_token_expires_at = $2 WHERE id = $3",
+            )
+            .bind(&token)
+            .bind(expires)
+            .bind(user_id)
+            .execute(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            info!(user_id = %user_id, token = %token, "Re-sent verification token for existing unverified user");
+
+            if let Some(ref email_sender) = state.email {
+                email_sender
+                    .send_verification_email(&body.email, &token)
+                    .await;
             }
-        })?;
 
-    let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let refresh_token = auth::create_refresh_token(&user_id, &state.jwt_secret)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(Json(serde_json::json!({
+                "status": "email_verification_required",
+                "user_id": user_id.to_string(),
+                "message": "Please check your email to verify your account."
+            })));
+        }
 
-    info!(user_id = %user_id, email = %body.email, "User signed up");
+        if email_verified && !totp_enabled {
+            // Issue temporary token so they can set up TOTP
+            let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(Json(serde_json::json!({
+                "status": "totp_setup_required",
+                "user_id": user_id.to_string(),
+                "access_token": access_token,
+                "message": "Email verified. Please set up 2FA to continue."
+            })));
+        }
 
-    Ok(Json(AuthResponse {
-        access_token,
-        refresh_token,
-        user_id: user_id.to_string(),
-    }))
+        // Fully set up user trying to re-register
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let user_id = Uuid::new_v4();
+    let verification_token = Uuid::new_v4().to_string();
+    let expires = chrono::Utc::now() + chrono::Duration::hours(24);
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, verification_token, verification_token_expires_at) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(user_id)
+    .bind(&body.email)
+    .bind(&password_hash)
+    .bind(&verification_token)
+    .bind(expires)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+
+    info!(user_id = %user_id, email = %body.email, token = %verification_token, "User signed up — verification token generated");
+
+    if let Some(ref email_sender) = state.email {
+        email_sender
+            .send_verification_email(&body.email, &verification_token)
+            .await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "email_verification_required",
+        "user_id": user_id.to_string(),
+        "message": "Account created. Please check your email to verify your account."
+    })))
 }
 
 pub async fn login(
     State(state): State<SharedState>,
     Json(body): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let row = sqlx::query(
-        "SELECT id, password_hash, totp_enabled, totp_secret FROM users WHERE email = $1",
+        "SELECT id, password_hash, email_verified, totp_enabled, totp_secret FROM users WHERE email = $1",
     )
     .bind(&body.email)
     .fetch_optional(&state.db)
@@ -246,6 +326,7 @@ pub async fn login(
 
     let user_id: Uuid = row.get("id");
     let password_hash: String = row.get("password_hash");
+    let email_verified: bool = row.get("email_verified");
     let totp_enabled: bool = row.get("totp_enabled");
 
     let valid = auth::verify_password(&body.password, &password_hash)
@@ -254,20 +335,71 @@ pub async fn login(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // 2FA check
-    if totp_enabled {
-        let totp_code = body.totp_code.as_deref().ok_or(StatusCode::FORBIDDEN)?;
-        let totp_secret: Vec<u8> = row.get("totp_secret");
+    // Step 1: Email must be verified
+    if !email_verified {
+        // Re-generate verification token
+        let token = Uuid::new_v4().to_string();
+        let expires = chrono::Utc::now() + chrono::Duration::hours(24);
+        sqlx::query(
+            "UPDATE users SET verification_token = $1, verification_token_expires_at = $2 WHERE id = $3",
+        )
+        .bind(&token)
+        .bind(expires)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, totp_secret, None, String::new())
+        info!(user_id = %user_id, token = %token, "Login attempt with unverified email — re-sent verification token");
+
+        if let Some(ref email_sender) = state.email {
+            email_sender
+                .send_verification_email(&body.email, &token)
+                .await;
+        }
+
+        return Ok(Json(serde_json::json!({
+            "status": "email_verification_required",
+            "user_id": user_id.to_string(),
+            "message": "Please verify your email before signing in. A new verification link has been sent."
+        })));
+    }
+
+    // Step 2: TOTP must be set up
+    if !totp_enabled {
+        // Issue a temporary access token so user can call /2fa/setup and /2fa/verify
+        let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        if !totp
-            .check_current(totp_code)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        {
-            return Err(StatusCode::UNAUTHORIZED);
+        return Ok(Json(serde_json::json!({
+            "status": "totp_setup_required",
+            "user_id": user_id.to_string(),
+            "access_token": access_token,
+            "message": "Please set up 2FA to continue."
+        })));
+    }
+
+    // Step 3: Verify TOTP code
+    let totp_code = match body.totp_code.as_deref() {
+        Some(code) if !code.is_empty() => code,
+        _ => {
+            return Ok(Json(serde_json::json!({
+                "status": "totp_required",
+                "user_id": user_id.to_string(),
+                "message": "Please enter your 2FA code."
+            })));
         }
+    };
+
+    let totp_secret: Vec<u8> = row.get("totp_secret");
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, totp_secret, None, String::new())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !totp
+        .check_current(totp_code)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
@@ -275,11 +407,12 @@ pub async fn login(
     let refresh_token = auth::create_refresh_token(&user_id, &state.jwt_secret)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(AuthResponse {
-        access_token,
-        refresh_token,
-        user_id: user_id.to_string(),
-    }))
+    Ok(Json(serde_json::json!({
+        "status": "authenticated",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user_id": user_id.to_string()
+    })))
 }
 
 pub async fn refresh_token(
@@ -319,6 +452,9 @@ pub async fn refresh_token(
         access_token,
         refresh_token,
         user_id: user_id.to_string(),
+        status: None,
+        email_verified: None,
+        totp_enabled: None,
     }))
 }
 
@@ -377,7 +513,7 @@ pub async fn verify_2fa(
     State(state): State<SharedState>,
     Extension(user): Extension<AuthUser>,
     Json(body): Json<TotpVerifyRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let totp_secret: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = $1")
             .bind(user.user_id)
@@ -404,7 +540,7 @@ pub async fn verify_2fa(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(StatusCode::OK)
+    Ok(Json(serde_json::json!({ "status": "2fa_enabled" })))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -423,7 +559,7 @@ pub async fn create_wallet(
     let resp = client
         .create_wallet(CreateWalletRequest {
             user_id: user.user_id.to_string(),
-            chain: body.chain.unwrap_or_else(|| "ethereum".to_string()),
+            chain: body.chain.unwrap_or_else(|| "bsc".to_string()),
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -439,7 +575,33 @@ pub async fn export_wallet(
     State(state): State<SharedState>,
     Extension(user): Extension<AuthUser>,
     Path(wallet_id): Path<String>,
+    Json(body): Json<ExportWalletBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Require TOTP verification
+    let row = sqlx::query("SELECT totp_enabled, totp_secret FROM users WHERE id = $1")
+        .bind(user.user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let totp_enabled: bool = row.get("totp_enabled");
+    if !totp_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let totp_code = body.totp_code.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    let totp_secret: Vec<u8> = row.get("totp_secret");
+
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, totp_secret, None, String::new())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !totp
+        .check_current(totp_code)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let mut client = WalletKmsClient::connect(state.kms_addr.clone())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -497,10 +659,17 @@ pub async fn get_balance(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
+    let token_address = if is_native_token_placeholder(&query.token_address) {
+        // Wallet balance does not include chain in query; BSC is the active chain.
+        normalize_token_for_chain("bsc", &query.token_address)
+    } else {
+        query.token_address.clone()
+    };
+
     let resp = client
         .get_balance(GetBalanceRequest {
             wallet_id,
-            token_address: query.token_address,
+            token_address,
             rpc_url: query.rpc_url,
         })
         .await
@@ -532,15 +701,19 @@ pub async fn create_session(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
+    let chain = body.chain.clone();
+    let sell_token = normalize_token_for_chain(&chain, &body.sell_token);
+    let target_token = normalize_token_for_chain(&chain, &body.target_token);
+
     let resp = client
         .create_session(CreateSessionRequest {
             user_id: user.user_id.to_string(),
             wallet_id: body.wallet_id,
-            chain: body.chain,
-            sell_token: body.sell_token,
+            chain: chain.clone(),
+            sell_token,
             sell_token_symbol: body.sell_token_symbol,
             sell_token_decimals: body.sell_token_decimals,
-            target_token: body.target_token,
+            target_token,
             target_token_symbol: body.target_token_symbol,
             target_token_decimals: body.target_token_decimals,
             strategy: "pov".to_string(),
@@ -557,8 +730,8 @@ pub async fn create_session(
                     pool_address: p.pool_address,
                     pool_type: p.pool_type,
                     dex_name: p.dex_name,
-                    token0: p.token0,
-                    token1: p.token1,
+                    token0: normalize_token_for_chain(&chain, &p.token0),
+                    token1: normalize_token_for_chain(&chain, &p.token1),
                     fee_tier: p.fee_tier,
                     reserve0: p.reserve0,
                     reserve1: p.reserve1,
@@ -659,11 +832,15 @@ pub async fn get_swap_paths(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
+    let chain = body.chain.clone();
+    let sell_token = normalize_token_for_chain(&chain, &body.sell_token);
+    let target_token = normalize_token_for_chain(&chain, &body.target_token);
+
     let resp = client
         .get_swap_paths(GetSwapPathsRequest {
-            chain: body.chain,
-            sell_token: body.sell_token,
-            target_token: body.target_token,
+            chain: chain.clone(),
+            sell_token,
+            target_token,
             amount: body.amount,
         })
         .await
@@ -677,7 +854,7 @@ pub async fn get_swap_paths(
             serde_json::json!({
                 "rank": p.rank,
                 "hops": p.hops,
-                "hop_tokens": p.hop_tokens,
+                "hop_tokens": p.hop_tokens.iter().map(|t| display_token_for_chain(&chain, t)).collect::<Vec<_>>(),
                 "estimated_output": p.estimated_output,
                 "estimated_price_impact": p.estimated_price_impact,
                 "fee_percent": p.fee_percent,
@@ -701,10 +878,13 @@ pub async fn discover_pools(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
+    let chain = body.chain.clone();
+    let token_address = normalize_token_for_chain(&chain, &body.token_address);
+
     let resp = client
         .discover_pools(DiscoverPoolsRequest {
-            chain: body.chain,
-            token_address: body.token_address,
+            chain: chain.clone(),
+            token_address,
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -718,8 +898,8 @@ pub async fn discover_pools(
                 "pool_address": p.pool_address,
                 "pool_type": p.pool_type,
                 "dex_name": p.dex_name,
-                "token0": p.token0,
-                "token1": p.token1,
+                "token0": display_token_for_chain(&chain, &p.token0),
+                "token1": display_token_for_chain(&chain, &p.token1),
                 "fee_tier": p.fee_tier,
                 "reserve0": p.reserve0,
                 "reserve1": p.reserve1,
@@ -749,15 +929,21 @@ pub async fn compute_pool_path(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
+    let chain = body.chain.clone();
+    let sell_token = normalize_token_for_chain(&chain, &body.sell_token);
+    let target_token = normalize_token_for_chain(&chain, &body.target_token);
+    let token0 = normalize_token_for_chain(&chain, &body.token0);
+    let token1 = normalize_token_for_chain(&chain, &body.token1);
+
     let resp = client
         .compute_pool_path(ComputePoolPathRequest {
-            chain: body.chain,
-            sell_token: body.sell_token,
-            target_token: body.target_token,
+            chain: chain.clone(),
+            sell_token,
+            target_token,
             pool_address: body.pool_address,
             pool_type: body.pool_type,
-            token0: body.token0,
-            token1: body.token1,
+            token0,
+            token1,
             fee_tier: body.fee_tier,
         })
         .await
@@ -768,7 +954,7 @@ pub async fn compute_pool_path(
         serde_json::json!({
             "rank": p.rank,
             "hops": p.hops,
-            "hop_tokens": p.hop_tokens,
+            "hop_tokens": p.hop_tokens.iter().map(|t| display_token_for_chain(&chain, t)).collect::<Vec<_>>(),
             "estimated_output": p.estimated_output,
             "estimated_price_impact": p.estimated_price_impact,
             "fee_percent": p.fee_percent,
@@ -799,9 +985,17 @@ pub async fn resend_verification(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // In production, send email with link containing `token`.
-    // For now, log it so it can be used in development.
-    info!(user_id = %user.user_id, token = %token, "Email verification token generated (send via email in production)");
+    // Send verification email (falls back to log-only if SMTP not configured)
+    info!(user_id = %user.user_id, token = %token, "Email verification token generated");
+
+    if let Some(ref email_sender) = state.email {
+        let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(user.user_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        email_sender.send_verification_email(&email, &token).await;
+    }
 
     Ok(StatusCode::OK)
 }
@@ -963,19 +1157,29 @@ pub async fn get_token_metadata(
     Extension(_user): Extension<AuthUser>,
     Query(query): Query<TokenMetadataQuery>,
 ) -> Result<Json<TokenMetadataResponse>, StatusCode> {
+    let chain = query.chain.trim().to_lowercase();
+
     // Validate address format
-    let address = query.address.trim().to_lowercase();
-    if !address.starts_with("0x") || address.len() != 42 {
+    let input_address = query.address.trim().to_lowercase();
+    if !input_address.starts_with("0x") || input_address.len() != 42 {
         return Err(StatusCode::BAD_REQUEST);
     }
     // Validate hex
-    hex::decode(&address[2..]).map_err(|_| StatusCode::BAD_REQUEST)?;
+    hex::decode(&input_address[2..]).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if chain == "bsc" && is_native_token_placeholder(&input_address) {
+        return Ok(Json(TokenMetadataResponse {
+            address: query.address,
+            name: "BNB".to_string(),
+            symbol: "BNB".to_string(),
+            decimals: 18,
+        }));
+    }
+
+    let address = normalize_token_for_chain(&chain, &input_address).to_lowercase();
 
     let cfg = liquifier_config::Settings::global();
-    let chain_cfg = cfg
-        .chains
-        .get(&query.chain)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let chain_cfg = cfg.chains.get(&chain).ok_or(StatusCode::BAD_REQUEST)?;
     if chain_cfg.rpc_url.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1080,6 +1284,9 @@ async fn erc20_call_uint8(
 // ─────────────────────────────────────────────────────────────
 
 fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
+    let sell_token = display_token_for_chain(&s.chain, &s.sell_token);
+    let target_token = display_token_for_chain(&s.chain, &s.target_token);
+
     let pools: Vec<serde_json::Value> = s
         .pools
         .iter()
@@ -1088,8 +1295,8 @@ fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
                 "pool_address": p.pool_address,
                 "pool_type": p.pool_type,
                 "dex_name": p.dex_name,
-                "token0": p.token0,
-                "token1": p.token1,
+                "token0": display_token_for_chain(&s.chain, &p.token0),
+                "token1": display_token_for_chain(&s.chain, &p.token1),
                 "fee_tier": p.fee_tier,
                 "reserve0": p.reserve0,
                 "reserve1": p.reserve1,
@@ -1109,10 +1316,10 @@ fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
         "wallet_id": s.wallet_id,
         "chain": s.chain,
         "status": s.status,
-        "sell_token": s.sell_token,
+        "sell_token": sell_token,
         "sell_token_symbol": s.sell_token_symbol,
         "sell_token_decimals": s.sell_token_decimals,
-        "target_token": s.target_token,
+        "target_token": target_token,
         "target_token_symbol": s.target_token_symbol,
         "target_token_decimals": s.target_token_decimals,
         "strategy": s.strategy,

@@ -39,6 +39,16 @@ session_api:
   grpc_addr: "http://localhost:50052"
   evm_rpc_url: ""
 
+# ─── SMTP / Email ─────────────────────────────────────────────
+smtp:
+  host: ""
+  port: 587
+  username: ""
+  password: ""
+  from_email: "noreply@liquifier.io"
+  from_name: "Liquifier"
+  base_url: "http://localhost:3000"
+
 # ─── API Gateway ──────────────────────────────────────────────
 api_gateway:
   http_port: 8080

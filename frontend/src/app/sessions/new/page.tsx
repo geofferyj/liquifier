@@ -22,6 +22,10 @@ const CHAIN_LABELS: Record<string, string> = {
   optimism: "Optimism",
 };
 
+const NATIVE_TOKEN_PLACEHOLDER = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const BSC_WBNB_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
+const BSC_USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955";
+
 interface TokenMeta {
   name: string;
   symbol: string;
@@ -70,6 +74,19 @@ const INITIAL_STATE: WizardState = {
 
 function isValidAddress(addr: string): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(addr);
+}
+
+function isNativePlaceholder(addr: string): boolean {
+  return addr.trim().toLowerCase() === NATIVE_TOKEN_PLACEHOLDER;
+}
+
+function normalizeTokenForProcessing(chain: Chain, addr: string): string {
+  const token = addr.trim();
+  if (!token) return token;
+  if (chain === "bsc" && isNativePlaceholder(token)) {
+    return BSC_WBNB_ADDRESS;
+  }
+  return token;
 }
 
 /** Convert a human-readable amount (e.g. "1.5") to wei string given decimals */
@@ -137,15 +154,42 @@ export default function SessionCreatePage() {
     [],
   );
 
+  const normalizedSellToken = normalizeTokenForProcessing(form.chain, form.sellToken);
+  const normalizedTargetToken = normalizeTokenForProcessing(form.chain, form.targetToken);
+
+  useEffect(() => {
+    if (enabledChains.length === 0) return;
+    const currentExists = enabledChains.some((c) => c.name === form.chain);
+    if (!currentExists) {
+      update({
+        chain: enabledChains[0].name as Chain,
+        sellTokenMeta: null,
+        targetTokenMeta: null,
+      });
+    }
+  }, [enabledChains, form.chain, update]);
+
   // ── Auto-fetch sell token metadata ──
   useEffect(() => {
     if (!isValidAddress(form.sellToken)) {
       update({ sellTokenMeta: null });
       return;
     }
+    if (form.chain === "bsc" && isNativePlaceholder(form.sellToken)) {
+      update({
+        sellTokenMeta: {
+          name: "BNB",
+          symbol: "BNB",
+          decimals: 18,
+          loading: false,
+          error: false,
+        },
+      });
+      return;
+    }
     update({ sellTokenMeta: { name: "", symbol: "", decimals: 18, loading: true, error: false } });
     api
-      .getTokenMetadata(form.chain, form.sellToken)
+      .getTokenMetadata(form.chain, normalizedSellToken)
       .then((meta) =>
         update({
           sellTokenMeta: {
@@ -162,7 +206,7 @@ export default function SessionCreatePage() {
           sellTokenMeta: { name: "", symbol: "", decimals: 18, loading: false, error: true },
         }),
       );
-  }, [form.sellToken, form.chain, update]);
+  }, [form.sellToken, form.chain, normalizedSellToken, update]);
 
   // ── Auto-fetch target token metadata ──
   useEffect(() => {
@@ -170,9 +214,21 @@ export default function SessionCreatePage() {
       update({ targetTokenMeta: null });
       return;
     }
+    if (form.chain === "bsc" && isNativePlaceholder(form.targetToken)) {
+      update({
+        targetTokenMeta: {
+          name: "BNB",
+          symbol: "BNB",
+          decimals: 18,
+          loading: false,
+          error: false,
+        },
+      });
+      return;
+    }
     update({ targetTokenMeta: { name: "", symbol: "", decimals: 18, loading: true, error: false } });
     api
-      .getTokenMetadata(form.chain, form.targetToken)
+      .getTokenMetadata(form.chain, normalizedTargetToken)
       .then((meta) =>
         update({
           targetTokenMeta: {
@@ -189,7 +245,7 @@ export default function SessionCreatePage() {
           targetTokenMeta: { name: "", symbol: "", decimals: 18, loading: false, error: true },
         }),
       );
-  }, [form.targetToken, form.chain, update]);
+  }, [form.targetToken, form.chain, normalizedTargetToken, update]);
 
   // ── Fetch wallet balance for sell token ──
   useEffect(() => {
@@ -199,11 +255,11 @@ export default function SessionCreatePage() {
     }
     setBalanceLoading(true);
     api
-      .getWalletBalance(form.walletId, form.sellToken)
+      .getWalletBalance(form.walletId, normalizedSellToken)
       .then((res) => setWalletBalanceWei(res.balance))
       .catch(() => setWalletBalanceWei(null))
       .finally(() => setBalanceLoading(false));
-  }, [form.walletId, form.sellToken]);
+  }, [form.walletId, form.sellToken, normalizedSellToken]);
 
   const sellDecimals = form.sellTokenMeta?.decimals ?? 18;
   const balanceHuman = walletBalanceWei ? fromWei(walletBalanceWei, sellDecimals) : null;
@@ -219,7 +275,7 @@ export default function SessionCreatePage() {
     mutationFn: () =>
       api.discoverPools({
         chain: form.chain,
-        token_address: form.sellToken,
+        token_address: normalizedSellToken,
       }),
     onSuccess: (data) => {
       const sorted = [...data.pools].sort((a, b) => {
@@ -274,12 +330,12 @@ export default function SessionCreatePage() {
         try {
           const result = await api.computePoolPath({
             chain: form.chain,
-            sell_token: form.sellToken,
-            target_token: form.targetToken,
+            sell_token: normalizedSellToken,
+            target_token: normalizedTargetToken,
             pool_address: address,
             pool_type: pool.pool_type,
-            token0: pool.token0,
-            token1: pool.token1,
+            token0: normalizeTokenForProcessing(form.chain, pool.token0),
+            token1: normalizeTokenForProcessing(form.chain, pool.token1),
             fee_tier: pool.fee_tier,
           });
 
@@ -325,7 +381,14 @@ export default function SessionCreatePage() {
         }
       }
     },
-    [form.chain, form.sellToken, form.targetToken, form.selectedPoolAddresses],
+    [
+      form.chain,
+      form.sellToken,
+      form.targetToken,
+      form.selectedPoolAddresses,
+      normalizedSellToken,
+      normalizedTargetToken,
+    ],
   );
 
   // ── Session creation ──
@@ -336,6 +399,8 @@ export default function SessionCreatePage() {
         .filter((p) => form.selectedPoolAddresses.has(p.pool_address))
         .map((p) => ({
           ...p,
+          token0: normalizeTokenForProcessing(form.chain, p.token0),
+          token1: normalizeTokenForProcessing(form.chain, p.token1),
           swap_path_json: form.poolPaths[p.pool_address]
             ? JSON.stringify(form.poolPaths[p.pool_address])
             : "",
@@ -344,10 +409,10 @@ export default function SessionCreatePage() {
       return api.createSession({
         wallet_id: form.walletId,
         chain: form.chain,
-        sell_token: form.sellToken,
+        sell_token: normalizedSellToken,
         sell_token_symbol: form.sellTokenMeta?.symbol ?? "",
         sell_token_decimals: form.sellTokenMeta?.decimals ?? 18,
-        target_token: form.targetToken,
+        target_token: normalizedTargetToken,
         target_token_symbol: form.targetTokenMeta?.symbol ?? "",
         target_token_decimals: form.targetTokenMeta?.decimals ?? 18,
         total_amount: toWei(form.totalAmount, sellDecimals),
@@ -506,6 +571,23 @@ export default function SessionCreatePage() {
                 value={form.targetToken}
                 onChange={(e) => update({ targetToken: e.target.value })}
               />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted-foreground">Shortcuts:</span>
+                <button
+                  type="button"
+                  className="px-2 py-1 text-xs rounded border border-border hover:border-primary transition-colors"
+                  onClick={() => update({ targetToken: NATIVE_TOKEN_PLACEHOLDER })}
+                >
+                  BNB (eeeee)
+                </button>
+                <button
+                  type="button"
+                  className="px-2 py-1 text-xs rounded border border-border hover:border-primary transition-colors"
+                  onClick={() => update({ targetToken: BSC_USDT_ADDRESS })}
+                >
+                  USDT
+                </button>
+              </div>
               {form.targetTokenMeta && <TokenMetaCard meta={form.targetTokenMeta} />}
             </div>
 

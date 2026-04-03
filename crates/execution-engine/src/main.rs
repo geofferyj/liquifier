@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     liquifier_config::Settings::init().expect("Failed to load config");
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
+        // .json()
         .init();
 
     let cfg = liquifier_config::Settings::global();

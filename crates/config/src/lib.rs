@@ -40,6 +40,8 @@ pub struct Settings {
     #[serde(default)]
     pub pricing: PricingSettings,
     #[serde(default)]
+    pub smtp: SmtpSettings,
+    #[serde(default)]
     pub chains: HashMap<String, ChainConfig>,
 }
 
@@ -266,6 +268,43 @@ impl Default for PricingSettings {
 }
 fn default_price_interval() -> u64 {
     30
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmtpSettings {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub from_email: String,
+    #[serde(default)]
+    pub from_name: String,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+}
+impl Default for SmtpSettings {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: default_smtp_port(),
+            username: String::new(),
+            password: String::new(),
+            from_email: String::new(),
+            from_name: String::new(),
+            base_url: default_base_url(),
+        }
+    }
+}
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_base_url() -> String {
+    "http://localhost:3000".into()
 }
 
 // ─────────────────────────────────────────────────────────────

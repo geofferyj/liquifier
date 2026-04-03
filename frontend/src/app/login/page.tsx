@@ -18,25 +18,43 @@ export default function LoginPage() {
   const [totpCode, setTotpCode] = useState("");
   const [needsTotp, setNeedsTotp] = useState(false);
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setInfo("");
     setLoading(true);
 
     try {
       const res = await api.login(email, password, totpCode || undefined);
-      setAuth(res.user_id);
-      router.push("/dashboard");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Login failed";
-      if (msg.includes("2FA") || msg.includes("totp")) {
-        setNeedsTotp(true);
-        setError("2FA code required");
-      } else {
-        setError(msg);
+
+      switch (res.status) {
+        case "authenticated":
+          setAuth(res.user_id);
+          router.push("/dashboard");
+          break;
+
+        case "email_verification_required":
+          setInfo(res.message || "Please check your email to verify your account.");
+          break;
+
+        case "totp_setup_required":
+          // Temporary token already stored by api.login
+          router.push("/setup-2fa");
+          break;
+
+        case "totp_required":
+          setNeedsTotp(true);
+          setInfo("Enter your 2FA code to continue.");
+          break;
+
+        default:
+          setError("Unexpected response. Please try again.");
       }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setLoading(false);
     }
@@ -93,8 +111,12 @@ export default function LoginPage() {
               <p className="text-sm text-destructive">{error}</p>
             )}
 
+            {info && !error && (
+              <p className="text-sm text-primary">{info}</p>
+            )}
+
             <Button type="submit" className="w-full" disabled={loading}>
-              {loading ? "Signing in..." : "Sign In"}
+              {loading ? "Signing in..." : needsTotp ? "Verify & Sign In" : "Sign In"}
             </Button>
           </form>
 

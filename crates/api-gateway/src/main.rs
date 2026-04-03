@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 mod auth;
+mod email;
 mod jwt_middleware;
 mod routes;
 
@@ -26,6 +27,7 @@ pub struct AppState {
     pub kms_addr: String,
     pub session_addr: String,
     pub ws_addr: String,
+    pub email: Option<email::EmailSender>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -40,7 +42,7 @@ async fn main() -> Result<()> {
     liquifier_config::Settings::init().expect("Failed to load config");
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
+        // .json()
         .init();
 
     let cfg = liquifier_config::Settings::global();
@@ -70,6 +72,8 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to connect to Redis")?;
 
+    let email_sender = email::EmailSender::new(&cfg.smtp);
+
     let state = Arc::new(AppState {
         db,
         redis: redis_conn,
@@ -77,6 +81,7 @@ async fn main() -> Result<()> {
         kms_addr,
         session_addr,
         ws_addr,
+        email: email_sender,
     });
 
     let cors = CorsLayer::new()

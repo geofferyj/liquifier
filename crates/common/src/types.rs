@@ -23,6 +23,12 @@ pub const SUBJECT_DEX_SWAPS: &str = "evm.dex.swaps";
 pub const SUBJECT_TRADES_COMPLETED: &str = "trades.completed";
 pub const SUBJECT_SESSION_UPDATES: &str = "session.updates";
 
+/// Special placeholder address used by many UIs to represent the native gas token.
+pub const NATIVE_TOKEN_PLACEHOLDER: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// Wrapped native token address for BSC.
+pub const BSC_WBNB_ADDRESS: &str = "0xbb4cdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
+
 // Re-export config chain types so existing consumers keep compiling
 pub use liquifier_config::{
     chain_name_to_id, enabled_chains, get_chain, ChainConfig, DexFactoryConfig,
@@ -94,4 +100,31 @@ pub fn dex_router_for_chain(chain: &str, dex_name: &str, pool_type: PoolType) ->
     } else {
         Some(router.to_string())
     }
+}
+
+/// Returns true when the address is the native-token placeholder.
+pub fn is_native_token_placeholder(address: &str) -> bool {
+    address
+        .trim()
+        .eq_ignore_ascii_case(NATIVE_TOKEN_PLACEHOLDER)
+}
+
+/// Normalize user-facing token addresses into process-safe addresses.
+/// For now, only BSC native placeholder is mapped to WBNB.
+pub fn normalize_token_for_chain(chain: &str, token_address: &str) -> String {
+    let token = token_address.trim();
+    if chain.eq_ignore_ascii_case("bsc") && is_native_token_placeholder(token) {
+        return BSC_WBNB_ADDRESS.to_string();
+    }
+    token.to_string()
+}
+
+/// Convert process-safe token addresses back to UI-facing representation.
+/// For now, only WBNB on BSC is mapped back to the native placeholder.
+pub fn display_token_for_chain(chain: &str, token_address: &str) -> String {
+    let token = token_address.trim();
+    if chain.eq_ignore_ascii_case("bsc") && token.eq_ignore_ascii_case(BSC_WBNB_ADDRESS) {
+        return NATIVE_TOKEN_PLACEHOLDER.to_string();
+    }
+    token.to_string()
 }

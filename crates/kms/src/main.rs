@@ -9,6 +9,7 @@ use common::proto::{
     GetWalletRequest, ListWalletsRequest, ListWalletsResponse, SignTransactionRequest,
     SignTransactionResponse, WalletInfo,
 };
+use common::types::normalize_token_for_chain;
 use liquifier_config::Settings;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -63,8 +64,14 @@ impl WalletKms for KmsService {
             .parse()
             .map_err(|_| Status::invalid_argument("Invalid user_id"))?;
 
-        // All EVM chains share the same address type — store as "ethereum"
-        let chain = "ethereum".to_string();
+        let chain = if req.chain.trim().is_empty() {
+            "bsc".to_string()
+        } else {
+            req.chain.trim().to_lowercase()
+        };
+        if !self.settings.chains.contains_key(&chain) {
+            return Err(Status::invalid_argument("Unsupported chain"));
+        }
 
         // Generate a new random private key using alloy
         let signer = PrivateKeySigner::random();
@@ -216,7 +223,7 @@ impl WalletKms for KmsService {
             .parse()
             .map_err(|_| Status::internal("Invalid wallet address in DB"))?;
 
-        let token_address = req.token_address.trim();
+        let token_address = normalize_token_for_chain(&chain_str, req.token_address.trim());
         if token_address.is_empty() {
             // Native balance
             let balance: U256 = provider
@@ -278,10 +285,11 @@ impl WalletKms for KmsService {
         let signer = PrivateKeySigner::from_slice(&private_key_bytes)
             .map_err(|e| Status::internal(format!("Key reconstruction error: {e}")))?;
 
-        // Sign the raw transaction bytes
+        // Sign the raw transaction bytes (hash first — unsigned_tx is RLP-encoded, not a hash)
         use alloy::signers::Signer;
+        let tx_hash = alloy::primitives::keccak256(&req.unsigned_tx);
         let signature = signer
-            .sign_hash(&alloy::primitives::B256::from_slice(&req.unsigned_tx))
+            .sign_hash(&tx_hash)
             .await
             .map_err(|e| Status::internal(format!("Signing error: {e}")))?;
 
@@ -350,7 +358,7 @@ async fn main() -> Result<()> {
     liquifier_config::Settings::init().expect("Failed to load config");
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
+        // .json()
         .init();
 
     let cfg = liquifier_config::Settings::global();

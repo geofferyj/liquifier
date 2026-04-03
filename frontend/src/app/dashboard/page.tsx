@@ -6,6 +6,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn, shortenAddress } from "@/lib/utils";
 import type { SessionStatus } from "@/lib/types";
 
@@ -32,12 +33,27 @@ export default function DashboardPage() {
     address: string;
   } | null>(null);
   const [exportingId, setExportingId] = useState<string | null>(null);
+  const [totpPrompt, setTotpPrompt] = useState<string | null>(null); // walletId awaiting TOTP
+  const [totpCode, setTotpCode] = useState("");
+  const [totpError, setTotpError] = useState("");
 
-  const handleExport = async (walletId: string) => {
-    setExportingId(walletId);
+  const handleExportRequest = (walletId: string) => {
+    setTotpPrompt(walletId);
+    setTotpCode("");
+    setTotpError("");
+    setExportedKey(null);
+  };
+
+  const handleExportConfirm = async () => {
+    if (!totpPrompt || !totpCode) return;
+    setExportingId(totpPrompt);
+    setTotpError("");
     try {
-      const res = await api.exportWallet(walletId);
-      setExportedKey({ walletId, privateKey: res.private_key, address: res.address });
+      const res = await api.exportWallet(totpPrompt, totpCode);
+      setExportedKey({ walletId: totpPrompt, privateKey: res.private_key, address: res.address });
+      setTotpPrompt(null);
+    } catch (err: unknown) {
+      setTotpError(err instanceof Error ? err.message : "Invalid 2FA code");
     } finally {
       setExportingId(null);
     }
@@ -95,13 +111,52 @@ export default function DashboardPage() {
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => handleExport(w.wallet_id)}
+                    onClick={() => handleExportRequest(w.wallet_id)}
                     disabled={exportingId === w.wallet_id}
                   >
                     {exportingId === w.wallet_id ? "Exporting..." : "Backup"}
                   </Button>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* TOTP prompt for export */}
+          {totpPrompt && !exportedKey && (
+            <div className="mt-4 p-4 rounded-lg border border-primary/50 bg-primary/5 space-y-3">
+              <p className="text-sm font-medium">
+                Enter your 2FA code to export the private key
+              </p>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={totpCode}
+                  onChange={(e) => setTotpCode(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleExportConfirm()}
+                  placeholder="000000"
+                  className="w-32 text-center tracking-widest"
+                  autoFocus
+                />
+                <Button
+                  size="sm"
+                  onClick={handleExportConfirm}
+                  disabled={totpCode.length < 6 || exportingId !== null}
+                >
+                  {exportingId ? "Verifying..." : "Confirm"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setTotpPrompt(null)}
+                >
+                  Cancel
+                </Button>
+              </div>
+              {totpError && (
+                <p className="text-sm text-destructive">{totpError}</p>
+              )}
             </div>
           )}
 

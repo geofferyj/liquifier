@@ -24,6 +24,27 @@ export interface AuthResponse {
   user_id: string;
 }
 
+export type AuthStatus =
+  | "authenticated"
+  | "email_verification_required"
+  | "totp_setup_required"
+  | "totp_required";
+
+export interface LoginResponse {
+  status: AuthStatus;
+  user_id: string;
+  message?: string;
+  access_token?: string;
+  refresh_token?: string;
+}
+
+export interface SignupResponse {
+  status: AuthStatus;
+  user_id: string;
+  message?: string;
+  access_token?: string;
+}
+
 export interface Wallet {
   wallet_id: string;
   address: string;
@@ -130,4 +151,5 @@ export interface UserProfile {
 export interface TotpSetupResponse {
   secret: string;
   otpauth_url: string;
+  qr_code_base64: string;
 }
