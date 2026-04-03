@@ -46,6 +46,7 @@ interface SessionLiveData {
 interface LiveDataState {
   sessions: Record<string, SessionLiveData>;
   updateSession: (msg: WsMessage) => void;
+  seedSession: (sessionId: string, data: Partial<SessionLiveData>) => void;
   reset: () => void;
 }
 
@@ -93,6 +94,30 @@ export const useLiveDataStore = create<LiveDataState>((set) => ({
       }
 
       return { sessions };
+    }),
+  seedSession: (sessionId, data) =>
+    set((state) => {
+      const existing = state.sessions[sessionId] ?? {
+        amountSold: "0",
+        remaining: "0",
+        convertedValueUsd: "0.00",
+        status: "pending",
+        recentTrades: [],
+      };
+
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            amountSold: data.amountSold ?? existing.amountSold,
+            remaining: data.remaining ?? existing.remaining,
+            convertedValueUsd:
+              data.convertedValueUsd ?? existing.convertedValueUsd,
+            status: data.status ?? existing.status,
+            recentTrades: data.recentTrades ?? existing.recentTrades,
+          },
+        },
+      };
     }),
   reset: () => set({ sessions: {} }),
 }));

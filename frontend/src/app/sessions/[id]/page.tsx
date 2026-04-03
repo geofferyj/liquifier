@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AreaChart,
@@ -48,6 +48,18 @@ export default function SessionDashboardPage() {
 
   // Live data from Zustand store
   const liveData = useLiveDataStore((s) => s.sessions[sessionId]);
+  const seedSession = useLiveDataStore((s) => s.seedSession);
+
+  // Fetch recent trades for first-load hydration.
+  const sessionTradesQuery = useQuery({
+    queryKey: ["session-trades", sessionId],
+    queryFn: async () => {
+      const resp = await api.getSessionTrades(sessionId, 50);
+      return resp.trades;
+    },
+    enabled: !!sessionId,
+    refetchInterval: 15_000,
+  });
 
   // Status mutation
   const statusMutation = useMutation({
@@ -81,6 +93,32 @@ export default function SessionDashboardPage() {
   });
 
   const session = sessionQuery.data;
+
+  useEffect(() => {
+    if (!session || !sessionId || !sessionTradesQuery.data) {
+      return;
+    }
+
+    if ((liveData?.recentTrades.length ?? 0) > 0) {
+      return;
+    }
+
+    seedSession(sessionId, {
+      amountSold: session.amount_sold,
+      remaining: (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString(),
+      convertedValueUsd: liveData?.convertedValueUsd ?? "0.00",
+      status: session.status,
+      recentTrades: sessionTradesQuery.data,
+    });
+  }, [
+    liveData?.convertedValueUsd,
+    liveData?.recentTrades.length,
+    seedSession,
+    session,
+    sessionId,
+    sessionTradesQuery.data,
+  ]);
+
   if (sessionQuery.isLoading) {
     return (
       <main className="min-h-screen flex items-center justify-center">
@@ -104,7 +142,10 @@ export default function SessionDashboardPage() {
       BigInt(session.total_amount) - BigInt(session.amount_sold)
     ).toString();
   const convertedUsd = liveData?.convertedValueUsd ?? "0.00";
-  const recentTrades = liveData?.recentTrades ?? [];
+  const recentTrades =
+    (liveData?.recentTrades.length ?? 0) > 0
+      ? liveData?.recentTrades ?? []
+      : sessionTradesQuery.data ?? [];
 
   // Build chart data from recent trades
   const chartData = recentTrades

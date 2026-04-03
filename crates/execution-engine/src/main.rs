@@ -297,7 +297,8 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                 // submit_transaction(&signed.signed_tx, &session.chain).await?;
 
                 // 7. Record trade in DB
-                record_trade(&state.db, session, &event, sell_amount, price_impact_bps).await?;
+                let recorded_trade =
+                    record_trade(&state.db, session, &event, sell_amount, price_impact_bps).await?;
 
                 // 8. If target token differs from pool's paired token,
                 // spawn async routing task
@@ -318,13 +319,22 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                 }
 
                 // 9. Publish trade completion event to NATS
+                let tx_hash = if signed.tx_hash.is_empty() {
+                    event.tx_hash.clone()
+                } else {
+                    signed.tx_hash.clone()
+                };
+
                 let trade_event = serde_json::json!({
+                    "type": "trade_completed",
+                    "trade_id": recorded_trade.trade_id,
                     "session_id": session.session_id,
                     "chain": session.chain,
                     "sell_amount": sell_amount.to_string(),
+                    "received_amount": event.amount_out,
+                    "tx_hash": tx_hash,
                     "price_impact_bps": price_impact_bps,
-                    "pool": event.pool_address,
-                    "trigger_tx": event.tx_hash,
+                    "executed_at": recorded_trade.executed_at,
                 });
                 let _ = state
                     .nats_js
@@ -375,21 +385,27 @@ fn chain_name_to_id(name: &str) -> u64 {
     liquifier_config::chain_name_to_id(&liquifier_config::Settings::global().chains, name)
 }
 
+struct RecordedTrade {
+    trade_id: String,
+    executed_at: String,
+}
+
 async fn record_trade(
     db: &PgPool,
     session: &SessionInfo,
     event: &DexSwapEvent,
     sell_amount: U256,
     price_impact_bps: u32,
-) -> Result<()> {
+) -> Result<RecordedTrade> {
     let session_id: uuid::Uuid = session.session_id.parse()?;
-    sqlx::query(
+    let (trade_id, executed_at): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
         r#"
         INSERT INTO trades (
             session_id, chain, status, trigger_tx_hash, trigger_pool,
             trigger_buy_amount, sell_amount, sell_pool, price_impact_bps, executed_at
         )
         VALUES ($1, $2::chain_id, 'confirmed', $3, $4, $5, $6, $7, $8, NOW())
+        RETURNING id::text, executed_at
         "#,
     )
     .bind(session_id)
@@ -400,7 +416,7 @@ async fn record_trade(
     .bind(sell_amount.to_string().parse::<i64>().unwrap_or(0))
     .bind(&event.pool_address)
     .bind(price_impact_bps as i32)
-    .execute(db)
+    .fetch_one(db)
     .await
     .context("Failed to record trade")?;
 
@@ -417,5 +433,8 @@ async fn record_trade(
     .await
     .context("Failed to update session")?;
 
-    Ok(())
+    Ok(RecordedTrade {
+        trade_id,
+        executed_at: executed_at.to_rfc3339(),
+    })
 }

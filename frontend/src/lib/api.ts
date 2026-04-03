@@ -4,6 +4,7 @@ import type {
   SignupResponse,
   PoolInfo,
   Session,
+  Trade,
   SwapPath,
   TotpSetupResponse,
   UserProfile,
@@ -222,6 +223,15 @@ class ApiClient {
     return this.request(`/api/v1/sessions/${sessionId}`);
   }
 
+  async getSessionTrades(
+    sessionId: string,
+    limit = 50,
+  ): Promise<{ trades: Trade[] }> {
+    return this.request(
+      `/api/v1/sessions/${sessionId}/trades?limit=${encodeURIComponent(limit)}`,
+    );
+  }
+
   async updateSessionStatus(
     sessionId: string,
     status: string,
@@ -298,6 +308,15 @@ class ApiClient {
 
   async getSessionBySlug(slug: string): Promise<Session> {
     return this.request(`/api/v1/public/${slug}`);
+  }
+
+  async getSessionTradesBySlug(
+    slug: string,
+    limit = 50,
+  ): Promise<{ trades: Trade[] }> {
+    return this.request(
+      `/api/v1/public/${slug}/trades?limit=${encodeURIComponent(limit)}`,
+    );
   }
 
   async getTokenMetadata(

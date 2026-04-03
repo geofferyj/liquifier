@@ -173,6 +173,20 @@ pub struct GetBalanceQuery {
     pub rpc_url: String,
 }
 
+fn default_trades_limit() -> i64 {
+    50
+}
+
+fn clamp_trades_limit(limit: i64) -> i64 {
+    limit.clamp(1, 200)
+}
+
+#[derive(Deserialize)]
+pub struct TradesQuery {
+    #[serde(default = "default_trades_limit")]
+    pub limit: i64,
+}
+
 // ─────────────────────────────────────────────────────────────
 // Health
 // ─────────────────────────────────────────────────────────────
@@ -1103,6 +1117,113 @@ pub async fn get_session_by_slug(
         .into_inner();
 
     Ok(Json(session_info_to_json(&resp)))
+}
+
+pub async fn get_session_trades(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path(session_id): Path<String>,
+    Query(query): Query<TradesQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session_id = session_id
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let limit = clamp_trades_limit(query.limit);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            t.id::text AS trade_id,
+            t.session_id::text AS session_id,
+            t.chain::text AS chain,
+            t.sell_amount::text AS sell_amount,
+            COALESCE(t.final_received, t.trigger_buy_amount)::text AS received_amount,
+            COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
+            COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
+            COALESCE(t.executed_at, t.created_at) AS executed_at
+        FROM trades t
+        INNER JOIN sessions s ON s.id = t.session_id
+        WHERE t.session_id = $1 AND s.user_id = $2
+        ORDER BY COALESCE(t.executed_at, t.created_at) DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(session_id)
+    .bind(user.user_id)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let trades: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let executed_at: chrono::DateTime<chrono::Utc> = row.get("executed_at");
+            serde_json::json!({
+                "trade_id": row.get::<String, _>("trade_id"),
+                "session_id": row.get::<String, _>("session_id"),
+                "chain": row.get::<String, _>("chain"),
+                "sell_amount": row.get::<String, _>("sell_amount"),
+                "received_amount": row.get::<String, _>("received_amount"),
+                "tx_hash": row.get::<String, _>("tx_hash"),
+                "price_impact_bps": row.get::<i32, _>("price_impact_bps"),
+                "executed_at": executed_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "trades": trades })))
+}
+
+pub async fn get_public_session_trades(
+    State(state): State<SharedState>,
+    Path(slug): Path<String>,
+    Query(query): Query<TradesQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = clamp_trades_limit(query.limit);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            t.id::text AS trade_id,
+            t.session_id::text AS session_id,
+            t.chain::text AS chain,
+            t.sell_amount::text AS sell_amount,
+            COALESCE(t.final_received, t.trigger_buy_amount)::text AS received_amount,
+            COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
+            COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
+            COALESCE(t.executed_at, t.created_at) AS executed_at
+        FROM trades t
+        INNER JOIN sessions s ON s.id = t.session_id
+        WHERE s.public_slug = $1 AND s.public_sharing_enabled = TRUE
+        ORDER BY COALESCE(t.executed_at, t.created_at) DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(slug)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let trades: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let executed_at: chrono::DateTime<chrono::Utc> = row.get("executed_at");
+            serde_json::json!({
+                "trade_id": row.get::<String, _>("trade_id"),
+                "session_id": row.get::<String, _>("session_id"),
+                "chain": row.get::<String, _>("chain"),
+                "sell_amount": row.get::<String, _>("sell_amount"),
+                "received_amount": row.get::<String, _>("received_amount"),
+                "tx_hash": row.get::<String, _>("tx_hash"),
+                "price_impact_bps": row.get::<i32, _>("price_impact_bps"),
+                "executed_at": executed_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "trades": trades })))
 }
 
 // ─────────────────────────────────────────────────────────────

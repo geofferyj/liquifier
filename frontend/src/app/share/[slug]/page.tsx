@@ -1,6 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
+import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { useSessionSocket } from "@/hooks/useSessionSocket";
@@ -36,12 +37,44 @@ export default function PublicSessionPage() {
     enabled: !!sessionQuery.data,
   });
 
-  const liveData = useLiveDataStore((s) => {
-    const entries = Object.entries(s.sessions);
-    return entries.length > 0 ? entries[0][1] : null;
+  const session = sessionQuery.data;
+  const sessionStoreKey = session?.session_id ?? slug;
+  const liveData = useLiveDataStore((s) => s.sessions[sessionStoreKey]);
+  const seedSession = useLiveDataStore((s) => s.seedSession);
+
+  const sessionTradesQuery = useQuery({
+    queryKey: ["public-session-trades", slug],
+    queryFn: async () => {
+      const resp = await api.getSessionTradesBySlug(slug, 50);
+      return resp.trades;
+    },
+    enabled: !!session,
+    refetchInterval: 15_000,
   });
 
-  const session = sessionQuery.data;
+  useEffect(() => {
+    if (!session || !sessionTradesQuery.data) {
+      return;
+    }
+
+    if ((liveData?.recentTrades.length ?? 0) > 0) {
+      return;
+    }
+
+    seedSession(session.session_id, {
+      amountSold: session.amount_sold,
+      remaining: (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString(),
+      convertedValueUsd: liveData?.convertedValueUsd ?? "0.00",
+      status: session.status,
+      recentTrades: sessionTradesQuery.data,
+    });
+  }, [
+    liveData?.convertedValueUsd,
+    liveData?.recentTrades.length,
+    seedSession,
+    session,
+    sessionTradesQuery.data,
+  ]);
 
   if (sessionQuery.isLoading) {
     return (
@@ -70,13 +103,16 @@ export default function PublicSessionPage() {
     liveData?.remaining ??
     (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString();
   const convertedUsd = liveData?.convertedValueUsd ?? "0.00";
-  const recentTrades = liveData?.recentTrades ?? [];
+  const recentTrades =
+    (liveData?.recentTrades.length ?? 0) > 0
+      ? liveData?.recentTrades ?? []
+      : sessionTradesQuery.data ?? [];
   const chartData = recentTrades
     .slice(0, 20)
     .reverse()
     .map((t, i) => ({
       index: i + 1,
-      amount: parseFloat(t.sell_amount) / 1e18,
+      amount: parseFloat(t.sell_amount) / Math.pow(10, session.sell_token_decimals),
       impact: t.price_impact_bps / 100,
       time: new Date(t.executed_at).toLocaleTimeString(),
     }));

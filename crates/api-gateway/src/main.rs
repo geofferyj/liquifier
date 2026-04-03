@@ -96,6 +96,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/auth/refresh", post(routes::refresh_token))
         .route("/api/v1/auth/verify-email", get(routes::verify_email))
         .route("/api/v1/public/{slug}", get(routes::get_session_by_slug))
+        .route(
+            "/api/v1/public/{slug}/trades",
+            get(routes::get_public_session_trades),
+        )
         .route("/api/v1/chains", get(routes::list_chains))
         .route("/api/v1/health", get(routes::health));
 
@@ -121,6 +125,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/sessions", post(routes::create_session))
         .route("/api/v1/sessions", get(routes::list_sessions))
         .route("/api/v1/sessions/{session_id}", get(routes::get_session))
+        .route(
+            "/api/v1/sessions/{session_id}/trades",
+            get(routes::get_session_trades),
+        )
         .route(
             "/api/v1/sessions/{session_id}/status",
             put(routes::update_session_status),
