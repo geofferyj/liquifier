@@ -7,7 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import type { Wallet } from "@/lib/types";
-import { useState } from "react";
 import { useRouter } from "next/navigation";
 
 export default function SettingsPage() {
@@ -30,13 +29,10 @@ export default function SettingsPage() {
   });
 
   const createWalletMutation = useMutation({
-    mutationFn: (chain: string) => api.createWallet(),
+    mutationFn: () => api.createWallet(),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["wallets"] }),
   });
-
-  const [selectedChain, setSelectedChain] = useState("ethereum");
-  const chains = ["ethereum", "base", "arbitrum", "bsc", "polygon", "optimism"];
 
   const profile = profileQuery.data;
   const wallets = walletsQuery.data?.wallets ?? [];
@@ -152,21 +148,10 @@ export default function SettingsPage() {
             </div>
           ))}
 
-          <div className="flex items-center gap-2 pt-2">
-            <select
-              className="rounded-md border border-border bg-background px-3 py-2 text-sm"
-              value={selectedChain}
-              onChange={(e) => setSelectedChain(e.target.value)}
-            >
-              {chains.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+          <div className="pt-2">
             <Button
               size="sm"
-              onClick={() => createWalletMutation.mutate(selectedChain)}
+              onClick={() => createWalletMutation.mutate()}
               disabled={createWalletMutation.isPending}
             >
               {createWalletMutation.isPending

@@ -180,13 +180,21 @@ impl WalletKms for KmsService {
                 .ok_or_else(|| Status::not_found("Wallet not found"))?;
 
         // Determine RPC URL: use request override, or look up from chain config
-        let rpc_url = if !req.rpc_url.is_empty() {
-            req.rpc_url
+        let rpc_url_override = req.rpc_url.trim();
+        let rpc_url = if !rpc_url_override.is_empty() {
+            rpc_url_override.to_string()
         } else {
             self.settings
                 .chains
                 .get(&chain_str)
-                .map(|c| c.rpc_url.clone())
+                .and_then(|c| {
+                    let url = c.rpc_url.trim();
+                    if url.is_empty() {
+                        None
+                    } else {
+                        Some(url.to_string())
+                    }
+                })
                 .ok_or_else(|| {
                     Status::failed_precondition(format!(
                         "No RPC URL configured for chain {chain_str}"
@@ -194,17 +202,22 @@ impl WalletKms for KmsService {
                 })?
         };
 
-        let provider = ProviderBuilder::new().connect_http(
-            rpc_url
-                .parse()
-                .map_err(|_| Status::internal("Invalid RPC URL"))?,
-        );
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().map_err(|_| {
+            if rpc_url_override.is_empty() {
+                Status::failed_precondition(format!(
+                    "Invalid RPC URL configured for chain {chain_str}"
+                ))
+            } else {
+                Status::invalid_argument("Invalid rpc_url")
+            }
+        })?);
 
         let address: Address = address_str
             .parse()
             .map_err(|_| Status::internal("Invalid wallet address in DB"))?;
 
-        if req.token_address.is_empty() {
+        let token_address = req.token_address.trim();
+        if token_address.is_empty() {
             // Native balance
             let balance: U256 = provider
                 .get_balance(address)
@@ -216,8 +229,7 @@ impl WalletKms for KmsService {
             }))
         } else {
             // ERC20 balance
-            let token: Address = req
-                .token_address
+            let token: Address = token_address
                 .parse()
                 .map_err(|_| Status::invalid_argument("Invalid token_address"))?;
             let contract = IERC20::new(token, &provider);

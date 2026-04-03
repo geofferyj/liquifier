@@ -151,6 +151,14 @@ pub struct SwapPathsBody {
     pub amount: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct GetBalanceQuery {
+    #[serde(default)]
+    pub token_address: String,
+    #[serde(default)]
+    pub rpc_url: String,
+}
+
 // ─────────────────────────────────────────────────────────────
 // Health
 // ─────────────────────────────────────────────────────────────
@@ -483,6 +491,7 @@ pub async fn get_balance(
     State(state): State<SharedState>,
     Extension(_user): Extension<AuthUser>,
     Path(wallet_id): Path<String>,
+    Query(query): Query<GetBalanceQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut client = WalletKmsClient::connect(state.kms_addr.clone())
         .await
@@ -491,11 +500,17 @@ pub async fn get_balance(
     let resp = client
         .get_balance(GetBalanceRequest {
             wallet_id,
-            token_address: String::new(),
-            rpc_url: String::new(),
+            token_address: query.token_address,
+            rpc_url: query.rpc_url,
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| match e.code() {
+            tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+            tonic::Code::NotFound => StatusCode::NOT_FOUND,
+            tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
+            tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?
         .into_inner();
 
     Ok(Json(serde_json::json!({

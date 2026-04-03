@@ -304,7 +304,9 @@ class ApiClient {
     walletId: string,
     tokenAddress?: string,
   ): Promise<{ balance: string; decimals: number }> {
-    const params = tokenAddress ? `?token_address=${tokenAddress}` : "";
+    const params = tokenAddress
+      ? `?token_address=${encodeURIComponent(tokenAddress)}`
+      : "";
     return this.request(`/api/v1/wallets/${walletId}/balance${params}`);
   }
 }

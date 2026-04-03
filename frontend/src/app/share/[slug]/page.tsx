@@ -16,6 +16,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { cn, formatTokenAmount, shortenTxHash } from "@/lib/utils";
+import type { SessionStatus } from "@/lib/types";
 
 export default function PublicSessionPage() {
   const params = useParams<{ slug: string }>();
@@ -32,7 +33,7 @@ export default function PublicSessionPage() {
   const { isConnected } = useSessionSocket({
     sessionId: slug,
     publicSlug: slug,
-    enabled: !!slug,
+    enabled: !!sessionQuery.data,
   });
 
   const liveData = useLiveDataStore((s) => {
@@ -42,6 +43,33 @@ export default function PublicSessionPage() {
 
   const session = sessionQuery.data;
 
+  if (sessionQuery.isLoading) {
+    return (
+      <main className="min-h-screen flex items-center justify-center">
+        <p className="text-muted-foreground">Loading session...</p>
+      </main>
+    );
+  }
+
+  if (sessionQuery.isError || !session) {
+    return (
+      <main className="min-h-screen flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <p className="text-destructive text-lg font-medium">Session not available</p>
+          <p className="text-sm text-muted-foreground">
+            This link may have been disabled or the session does not exist.
+          </p>
+        </div>
+      </main>
+    );
+  }
+
+  const status = (liveData?.status ?? session.status) as SessionStatus;
+  const amountSold = liveData?.amountSold ?? session.amount_sold;
+  const remaining =
+    liveData?.remaining ??
+    (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString();
+  const convertedUsd = liveData?.convertedValueUsd ?? "0.00";
   const recentTrades = liveData?.recentTrades ?? [];
   const chartData = recentTrades
     .slice(0, 20)
@@ -78,8 +106,38 @@ export default function PublicSessionPage() {
         </div>
       </div>
 
+      {/* Status badge */}
+      <div className="flex items-center gap-2">
+        <span
+          className={cn(
+            "px-2.5 py-0.5 rounded-full text-xs font-medium",
+            status === "active" && "bg-green-500/10 text-green-500",
+            status === "paused" && "bg-yellow-500/10 text-yellow-500",
+            status === "completed" && "bg-blue-500/10 text-blue-500",
+            status === "cancelled" && "bg-red-500/10 text-red-500",
+            status === "pending" && "bg-muted text-muted-foreground",
+            status === "error" && "bg-red-500/10 text-red-500"
+          )}
+        >
+          {status.toUpperCase()}
+        </span>
+      </div>
+
       {/* Metric cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-muted-foreground">
+              Total to Sell
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold font-mono">
+              {formatTokenAmount(session.total_amount, session.sell_token_decimals)}
+            </p>
+            <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
+          </CardContent>
+        </Card>
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
@@ -88,8 +146,9 @@ export default function PublicSessionPage() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold font-mono text-primary">
-              {liveData?.amountSold ?? "—"}
+              {formatTokenAmount(amountSold, session.sell_token_decimals)}
             </p>
+            <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
           </CardContent>
         </Card>
         <Card>
@@ -100,8 +159,9 @@ export default function PublicSessionPage() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold font-mono">
-              {liveData?.remaining ?? "—"}
+              {formatTokenAmount(remaining, session.sell_token_decimals)}
             </p>
+            <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
           </CardContent>
         </Card>
         <Card>
@@ -112,8 +172,9 @@ export default function PublicSessionPage() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold font-mono text-primary">
-              ${liveData?.convertedValueUsd ?? "0.00"}
+              ${convertedUsd}
             </p>
+            <p className="text-xs text-muted-foreground">{session.target_token_symbol}</p>
           </CardContent>
         </Card>
       </div>
