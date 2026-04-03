@@ -54,6 +54,7 @@ export interface PoolInfo {
   balance1: string;
   token0_price_usd: number;
   token1_price_usd: number;
+  swap_path_json: string;
 }
 
 export interface Session {

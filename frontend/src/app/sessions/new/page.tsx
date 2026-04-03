@@ -22,14 +22,6 @@ const CHAIN_LABELS: Record<string, string> = {
   optimism: "Optimism",
 };
 
-function compareBigInt(a: string, b: string): number {
-  if (!a && !b) return 0;
-  if (!a) return -1;
-  if (!b) return 1;
-  try { return a.length !== b.length ? a.length - b.length : (a < b ? -1 : a > b ? 1 : 0); }
-  catch { return 0; }
-}
-
 interface TokenMeta {
   name: string;
   symbol: string;
@@ -91,6 +83,30 @@ function fromWei(wei: string, decimals: number): string {
   const frac = padded.slice(padded.length - decimals);
   const trimmed = frac.replace(/0+$/, "");
   return trimmed ? `${whole}.${trimmed}` : whole;
+}
+
+function poolUsdValue(pool: PoolInfo, sellDecimals: number): number | null {
+  // Compute total USD value of pool's token holdings
+  const amt0 = pool.reserve0 || pool.balance0;
+  const amt1 = pool.reserve1 || pool.balance1;
+  let total = 0;
+  let hasPrice = false;
+  if (amt0 && pool.token0_price_usd > 0) {
+    total += parseFloat(fromWei(amt0, sellDecimals)) * pool.token0_price_usd;
+    hasPrice = true;
+  }
+  if (amt1 && pool.token1_price_usd > 0) {
+    // Use 18 as default for paired token (base tokens are typically 18 or we approximate)
+    total += parseFloat(fromWei(amt1, 18)) * pool.token1_price_usd;
+    hasPrice = true;
+  }
+  return hasPrice ? total : null;
+}
+
+function formatUsd(value: number): string {
+  if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `$${(value / 1_000).toFixed(2)}K`;
+  return `$${value.toFixed(2)}`;
 }
 
 export default function SessionCreatePage() {
@@ -185,13 +201,11 @@ export default function SessionCreatePage() {
         token_address: form.sellToken,
       }),
     onSuccess: (data) => {
-      // Sort: V2 by reserve0 descending, V3 by liquidity descending
+      // Sort by USD value descending (pools with prices first)
       const sorted = [...data.pools].sort((a, b) => {
-        if (a.pool_type !== b.pool_type) return a.pool_type === "v2" ? -1 : 1;
-        if (a.pool_type === "v2") {
-          return compareBigInt(b.reserve0, a.reserve0);
-        }
-        return compareBigInt(b.liquidity, a.liquidity);
+        const usdA = poolUsdValue(a, form.sellTokenMeta?.decimals ?? 18) ?? -1;
+        const usdB = poolUsdValue(b, form.sellTokenMeta?.decimals ?? 18) ?? -1;
+        return usdB - usdA;
       });
       update({ discoveredPools: sorted, selectedPoolAddresses: new Set(), computedPaths: [] });
     },
@@ -439,17 +453,12 @@ export default function SessionCreatePage() {
                               )}
                             </div>
                             <div className="flex items-center gap-3">
-                              {pool.pool_type === "v2" && (pool.reserve0 || pool.reserve1) && (
-                                <span className="text-muted-foreground">
-                                  R: {fromWei(pool.reserve0, sellDecimals)}/{fromWei(pool.reserve1, sellDecimals)}
-                                </span>
-                              )}
-                              {pool.pool_type === "v3" && (
-                                <span className="text-muted-foreground">
-                                  {pool.liquidity && <>L: {Number(pool.liquidity).toLocaleString()}</>}
-                                  {(pool.balance0 || pool.balance1) && <> B: {fromWei(pool.balance0, sellDecimals)}/{fromWei(pool.balance1, sellDecimals)}</>}
-                                </span>
-                              )}
+                              {(() => {
+                                const usd = poolUsdValue(pool, sellDecimals);
+                                return usd !== null ? (
+                                  <span className="text-green-500 font-medium">{formatUsd(usd)}</span>
+                                ) : null;
+                              })()}
                               <code className="text-muted-foreground">
                                 {pool.pool_address.slice(0, 8)}...{pool.pool_address.slice(-6)}
                               </code>

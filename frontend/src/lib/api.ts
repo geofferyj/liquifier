@@ -240,6 +240,22 @@ class ApiClient {
     });
   }
 
+  async computePoolPath(params: {
+    chain: string;
+    sell_token: string;
+    target_token: string;
+    pool_address: string;
+    pool_type: string;
+    token0: string;
+    token1: string;
+    fee_tier: number;
+  }): Promise<{ path: SwapPath | null }> {
+    return this.request("/api/v1/sessions/pools/path", {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
+
   // ── Session Config / Sharing ───────────────────────────────
 
   async updateSessionConfig(

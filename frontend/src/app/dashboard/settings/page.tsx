@@ -30,7 +30,7 @@ export default function SettingsPage() {
   });
 
   const createWalletMutation = useMutation({
-    mutationFn: (chain: string) => api.createWallet(chain),
+    mutationFn: (chain: string) => api.createWallet(),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["wallets"] }),
   });

@@ -1,6 +1,8 @@
 use alloy::{primitives::Address, providers::Provider, sol};
 use anyhow::Result;
 use common::types::{base_tokens_for_chain, dex_factories_for_chain, DexFactoryConfig, PoolType};
+use liquifier_config::Settings;
+use std::collections::HashMap;
 use tracing::{info, warn};
 
 // ABI fragments for V2 and V3 factory getPair/getPool calls
@@ -30,6 +32,18 @@ sol! {
     #[sol(rpc)]
     interface IERC20 {
         function balanceOf(address account) external view returns (uint256);
+        function decimals() external view returns (uint8);
+    }
+
+    #[sol(rpc)]
+    interface IAggregatorV3 {
+        function latestRoundData() external view returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
         function decimals() external view returns (uint8);
     }
 }
@@ -134,6 +148,25 @@ pub async fn discover_pools<P: Provider + Clone>(
         "Pool discovery complete"
     );
 
+    // Enrich pools with USD prices for base tokens
+    let base_prices = fetch_base_token_prices(&provider, chain).await;
+    for pool in &mut pools {
+        let t0 = pool.token0.to_lowercase();
+        let t1 = pool.token1.to_lowercase();
+        if let Some(&price) = base_prices.get(&t0) {
+            pool.token0_price_usd = price;
+        }
+        if let Some(&price) = base_prices.get(&t1) {
+            pool.token1_price_usd = price;
+        }
+        // If one token is not a base token, derive its price from reserves/balances
+        if pool.token0_price_usd == 0.0 && pool.token1_price_usd > 0.0 {
+            pool.token0_price_usd = derive_price_from_pool(pool, true);
+        } else if pool.token1_price_usd == 0.0 && pool.token0_price_usd > 0.0 {
+            pool.token1_price_usd = derive_price_from_pool(pool, false);
+        }
+    }
+
     Ok(pools)
 }
 
@@ -178,6 +211,8 @@ async fn discover_v2_pool<P: Provider + Clone>(
         liquidity: String::new(),
         balance0: String::new(),
         balance1: String::new(),
+        token0_price_usd: 0.0,
+        token1_price_usd: 0.0,
     }))
 }
 
@@ -243,5 +278,76 @@ async fn discover_v3_pool<P: Provider + Clone>(
         liquidity,
         balance0,
         balance1,
+        token0_price_usd: 0.0,
+        token1_price_usd: 0.0,
     }))
+}
+
+/// Fetch Chainlink USD prices for all base tokens on the given chain.
+async fn fetch_base_token_prices<P: Provider + Clone>(
+    provider: &P,
+    chain: &str,
+) -> HashMap<String, f64> {
+    let mut prices = HashMap::new();
+    let settings = Settings::global();
+    let chain_cfg = match settings.chains.get(chain) {
+        Some(c) => c,
+        None => return prices,
+    };
+
+    for bt in &chain_cfg.base_tokens {
+        if bt.chainlink_oracle.is_empty() {
+            continue;
+        }
+        let oracle_addr: Address = match bt.chainlink_oracle.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let contract = IAggregatorV3::new(oracle_addr, provider.clone());
+
+        let feed_decimals = match contract.decimals().call().await {
+            Ok(d) => d as u32,
+            Err(_) => 8,
+        };
+
+        match contract.latestRoundData().call().await {
+            Ok(round) => {
+                let price: f64 = round.answer.to_string().parse().unwrap_or(0.0)
+                    / 10f64.powi(feed_decimals as i32);
+                if price > 0.0 {
+                    prices.insert(bt.address.to_lowercase(), price);
+                }
+            }
+            Err(e) => {
+                warn!(token = %bt.symbol, error = %e, "Failed to fetch Chainlink price");
+            }
+        }
+    }
+
+    prices
+}
+
+/// Derive the price of the unknown token from pool reserves/balances.
+fn derive_price_from_pool(pool: &DiscoveredPool, derive_token0: bool) -> f64 {
+    let (amount_known, amount_unknown, known_price) = if derive_token0 {
+        let a1 = parse_amount(&pool.reserve1).or_else(|| parse_amount(&pool.balance1));
+        let a0 = parse_amount(&pool.reserve0).or_else(|| parse_amount(&pool.balance0));
+        (a1, a0, pool.token1_price_usd)
+    } else {
+        let a0 = parse_amount(&pool.reserve0).or_else(|| parse_amount(&pool.balance0));
+        let a1 = parse_amount(&pool.reserve1).or_else(|| parse_amount(&pool.balance1));
+        (a0, a1, pool.token0_price_usd)
+    };
+
+    match (amount_known, amount_unknown) {
+        (Some(ak), Some(au)) if au > 0.0 => (ak / au) * known_price,
+        _ => 0.0,
+    }
+}
+
+fn parse_amount(s: &str) -> Option<f64> {
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|v| *v > 0.0)
 }

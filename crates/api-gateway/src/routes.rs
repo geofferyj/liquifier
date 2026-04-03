@@ -5,10 +5,10 @@ use axum::{
 };
 use common::proto::{
     session_service_client::SessionServiceClient, wallet_kms_client::WalletKmsClient,
-    CreateSessionRequest, CreateWalletRequest, DiscoverPoolsRequest, ExportPrivateKeyRequest,
-    GetBalanceRequest, GetSessionBySlugRequest, GetSessionRequest, GetSwapPathsRequest,
-    ListSessionsRequest, ListWalletsRequest, PoolInfo, TogglePublicSharingRequest,
-    UpdateSessionConfigRequest, UpdateSessionStatusRequest,
+    ComputePoolPathRequest, CreateSessionRequest, CreateWalletRequest, DiscoverPoolsRequest,
+    ExportPrivateKeyRequest, GetBalanceRequest, GetSessionBySlugRequest, GetSessionRequest,
+    GetSwapPathsRequest, ListSessionsRequest, ListWalletsRequest, PoolInfo,
+    TogglePublicSharingRequest, UpdateSessionConfigRequest, UpdateSessionStatusRequest,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -104,12 +104,26 @@ pub struct PoolInfoBody {
     pub token0_price_usd: f64,
     #[serde(default)]
     pub token1_price_usd: f64,
+    #[serde(default)]
+    pub swap_path_json: String,
 }
 
 #[derive(Deserialize)]
 pub struct DiscoverPoolsBody {
     pub chain: String,
     pub token_address: String,
+}
+
+#[derive(Deserialize)]
+pub struct ComputePoolPathBody {
+    pub chain: String,
+    pub sell_token: String,
+    pub target_token: String,
+    pub pool_address: String,
+    pub pool_type: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee_tier: u32,
 }
 
 #[derive(Deserialize)]
@@ -536,6 +550,9 @@ pub async fn create_session(
                     liquidity: p.liquidity,
                     balance0: p.balance0,
                     balance1: p.balance1,
+                    token0_price_usd: p.token0_price_usd,
+                    token1_price_usd: p.token1_price_usd,
+                    swap_path_json: p.swap_path_json,
                 })
                 .collect(),
         })
@@ -694,11 +711,56 @@ pub async fn discover_pools(
                 "liquidity": p.liquidity,
                 "balance0": p.balance0,
                 "balance1": p.balance1,
+                "token0_price_usd": p.token0_price_usd,
+                "token1_price_usd": p.token1_price_usd,
+                "swap_path_json": p.swap_path_json,
             })
         })
         .collect();
 
     Ok(Json(serde_json::json!({ "pools": pools })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Compute Pool Path
+// ─────────────────────────────────────────────────────────────
+
+pub async fn compute_pool_path(
+    State(state): State<SharedState>,
+    Extension(_user): Extension<AuthUser>,
+    Json(body): Json<ComputePoolPathBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut client = SessionServiceClient::connect(state.session_api_addr.clone())
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let resp = client
+        .compute_pool_path(ComputePoolPathRequest {
+            chain: body.chain,
+            sell_token: body.sell_token,
+            target_token: body.target_token,
+            pool_address: body.pool_address,
+            pool_type: body.pool_type,
+            token0: body.token0,
+            token1: body.token1,
+            fee_tier: body.fee_tier,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    let path = resp.path.map(|p| {
+        serde_json::json!({
+            "rank": p.rank,
+            "hops": p.hops,
+            "hop_tokens": p.hop_tokens,
+            "estimated_output": p.estimated_output,
+            "estimated_price_impact": p.estimated_price_impact,
+            "fee_percent": p.fee_percent,
+        })
+    });
+
+    Ok(Json(serde_json::json!({ "path": path })))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1019,6 +1081,9 @@ fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
                 "liquidity": p.liquidity,
                 "balance0": p.balance0,
                 "balance1": p.balance1,
+                "token0_price_usd": p.token0_price_usd,
+                "token1_price_usd": p.token1_price_usd,
+                "swap_path_json": p.swap_path_json,
             })
         })
         .collect();

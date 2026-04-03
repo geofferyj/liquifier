@@ -133,6 +133,10 @@ async fn main() -> Result<()> {
             "/api/v1/sessions/pools/discover",
             post(routes::discover_pools),
         )
+        .route(
+            "/api/v1/sessions/pools/path",
+            post(routes::compute_pool_path),
+        )
         .route("/api/v1/tokens/metadata", get(routes::get_token_metadata))
         .layer(middleware::from_fn_with_state(
             state.clone(),

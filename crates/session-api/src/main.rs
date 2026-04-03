@@ -2,10 +2,11 @@ use alloy::providers::ProviderBuilder;
 use anyhow::{Context, Result};
 use common::proto::{
     session_service_server::{SessionService, SessionServiceServer},
-    ActiveSessionsQuery, ActiveSessionsResponse, CreateSessionRequest, DiscoverPoolsRequest,
-    DiscoverPoolsResponse, GetSessionBySlugRequest, GetSessionRequest, GetSwapPathsRequest,
-    GetSwapPathsResponse, ListSessionsRequest, ListSessionsResponse, PoolInfo, SessionInfo,
-    SwapPath, TogglePublicSharingRequest, UpdateSessionConfigRequest, UpdateSessionStatusRequest,
+    ActiveSessionsQuery, ActiveSessionsResponse, ComputePoolPathRequest, ComputePoolPathResponse,
+    CreateSessionRequest, DiscoverPoolsRequest, DiscoverPoolsResponse, GetSessionBySlugRequest,
+    GetSessionRequest, GetSwapPathsRequest, GetSwapPathsResponse, ListSessionsRequest,
+    ListSessionsResponse, PoolInfo, SessionInfo, SwapPath, TogglePublicSharingRequest,
+    UpdateSessionConfigRequest, UpdateSessionStatusRequest,
 };
 use rand::distr::Alphanumeric;
 use rand::RngExt;
@@ -108,10 +109,15 @@ impl SessionService for SessionServiceImpl {
 
         // Persist discovered pools
         for pool in &req.pools {
+            let swap_path_val: Option<serde_json::Value> = if pool.swap_path_json.is_empty() {
+                None
+            } else {
+                serde_json::from_str(&pool.swap_path_json).ok()
+            };
             sqlx::query(
                 r#"
-                INSERT INTO session_pools (session_id, pool_address, pool_type, dex_name, token0, token1, fee_tier)
-                VALUES ($1, $2, $3::pool_type, $4, $5, $6, $7)
+                INSERT INTO session_pools (session_id, pool_address, pool_type, dex_name, token0, token1, fee_tier, swap_path)
+                VALUES ($1, $2, $3::pool_type, $4, $5, $6, $7, $8)
                 ON CONFLICT (session_id, pool_address) DO NOTHING
                 "#,
             )
@@ -122,6 +128,7 @@ impl SessionService for SessionServiceImpl {
             .bind(&pool.token0)
             .bind(&pool.token1)
             .bind(pool.fee_tier as i32)
+            .bind(swap_path_val)
             .execute(&self.db)
             .await
             .map_err(|e| Status::internal(format!("DB error inserting pool: {e}")))?;
@@ -303,6 +310,91 @@ impl SessionService for SessionServiceImpl {
         Ok(Response::new(GetSwapPathsResponse { paths }))
     }
 
+    async fn compute_pool_path(
+        &self,
+        request: Request<ComputePoolPathRequest>,
+    ) -> Result<Response<ComputePoolPathResponse>, Status> {
+        let req = request.into_inner();
+
+        let sell = req.sell_token.to_lowercase();
+        let target = req.target_token.to_lowercase();
+        let t0 = req.token0.to_lowercase();
+        let t1 = req.token1.to_lowercase();
+
+        // Determine the "other" token in the pool (the one that isn't the sell token)
+        let other_token = if t0 == sell {
+            &req.token1
+        } else if t1 == sell {
+            &req.token0
+        } else {
+            return Err(Status::invalid_argument(
+                "Sell token not found in pool's token pair",
+            ));
+        };
+
+        // Case 1: Direct pair — pool contains both sell and target tokens
+        if t0 == target || t1 == target {
+            let path = SwapPath {
+                rank: 1,
+                hops: vec![req.pool_address.clone()],
+                hop_tokens: vec![req.sell_token.clone(), req.target_token.clone()],
+                estimated_output: String::new(),
+                estimated_price_impact: 0.0,
+                fee_percent: if req.fee_tier > 0 {
+                    req.fee_tier as f64 / 10000.0
+                } else {
+                    0.3
+                },
+            };
+            return Ok(Response::new(ComputePoolPathResponse { path: Some(path) }));
+        }
+
+        // Case 2: The pool's other token is a base token — try to find a second pool
+        // from other_token → target_token
+        let rpc_url: alloy::transports::http::reqwest::Url = self
+            .rpc_url
+            .parse()
+            .map_err(|_| Status::internal("Invalid RPC URL"))?;
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+        let second_pools = pools::discover_pools(provider, &req.chain, &req.target_token)
+            .await
+            .map_err(|e| Status::internal(format!("Pool discovery failed: {e}")))?;
+
+        // Find a pool that pairs other_token with target_token
+        let other_lower = other_token.to_lowercase();
+        if let Some(bridge) = second_pools.iter().find(|p| {
+            let pt0 = p.token0.to_lowercase();
+            let pt1 = p.token1.to_lowercase();
+            (pt0 == other_lower && pt1 == target) || (pt1 == other_lower && pt0 == target)
+        }) {
+            let path = SwapPath {
+                rank: 1,
+                hops: vec![req.pool_address.clone(), bridge.pool_address.clone()],
+                hop_tokens: vec![
+                    req.sell_token.clone(),
+                    other_token.to_string(),
+                    req.target_token.clone(),
+                ],
+                estimated_output: String::new(),
+                estimated_price_impact: 0.0,
+                fee_percent: if req.fee_tier > 0 {
+                    req.fee_tier as f64 / 10000.0
+                } else {
+                    0.3
+                } + if bridge.fee_tier > 0 {
+                    bridge.fee_tier as f64 / 10000.0
+                } else {
+                    0.3
+                },
+            };
+            return Ok(Response::new(ComputePoolPathResponse { path: Some(path) }));
+        }
+
+        // No route found
+        Ok(Response::new(ComputePoolPathResponse { path: None }))
+    }
+
     async fn get_active_sessions_for_token(
         &self,
         request: Request<ActiveSessionsQuery>,
@@ -392,6 +484,9 @@ impl SessionService for SessionServiceImpl {
                 liquidity: p.liquidity,
                 balance0: p.balance0,
                 balance1: p.balance1,
+                token0_price_usd: p.token0_price_usd,
+                token1_price_usd: p.token1_price_usd,
+                swap_path_json: String::new(),
             })
             .collect();
 
@@ -565,7 +660,7 @@ fn row_to_session_info(row: &sqlx::postgres::PgRow) -> SessionInfo {
 async fn fetch_session_pools(db: &PgPool, session_id: Uuid) -> Result<Vec<PoolInfo>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        SELECT pool_address, pool_type::text, dex_name, token0, token1, fee_tier
+        SELECT pool_address, pool_type::text, dex_name, token0, token1, fee_tier, swap_path
         FROM session_pools
         WHERE session_id = $1
         ORDER BY dex_name, pool_type::text, fee_tier
@@ -577,18 +672,24 @@ async fn fetch_session_pools(db: &PgPool, session_id: Uuid) -> Result<Vec<PoolIn
 
     Ok(rows
         .iter()
-        .map(|r| PoolInfo {
-            pool_address: r.get("pool_address"),
-            pool_type: r.get("pool_type"),
-            dex_name: r.get("dex_name"),
-            token0: r.get("token0"),
-            token1: r.get("token1"),
-            fee_tier: r.get::<i32, _>("fee_tier") as u32,
-            reserve0: String::new(),
-            reserve1: String::new(),
-            liquidity: String::new(),
-            balance0: String::new(),
-            balance1: String::new(),
+        .map(|r| {
+            let sp: Option<serde_json::Value> = r.get("swap_path");
+            PoolInfo {
+                pool_address: r.get("pool_address"),
+                pool_type: r.get("pool_type"),
+                dex_name: r.get("dex_name"),
+                token0: r.get("token0"),
+                token1: r.get("token1"),
+                fee_tier: r.get::<i32, _>("fee_tier") as u32,
+                reserve0: String::new(),
+                reserve1: String::new(),
+                liquidity: String::new(),
+                balance0: String::new(),
+                balance1: String::new(),
+                token0_price_usd: 0.0,
+                token1_price_usd: 0.0,
+                swap_path_json: sp.map(|v| v.to_string()).unwrap_or_default(),
+            }
         })
         .collect())
 }

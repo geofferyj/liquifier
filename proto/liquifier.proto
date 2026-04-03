@@ -107,6 +107,9 @@ service SessionService {
     // Routing
   rpc GetSwapPaths(GetSwapPathsRequest) returns (GetSwapPathsResponse);
 
+    // Compute a swap path through a specific pool
+  rpc ComputePoolPath(ComputePoolPathRequest) returns (ComputePoolPathResponse);
+
     // Query active sessions (used by Execution Engine)
   rpc GetActiveSessionsForToken(ActiveSessionsQuery) returns (ActiveSessionsResponse);
 }
@@ -203,6 +206,21 @@ message ActiveSessionsResponse {
   repeated SessionInfo sessions = 1;
 }
 
+message ComputePoolPathRequest {
+  string chain        = 1;
+  string sell_token   = 2;
+  string target_token = 3;
+  string pool_address = 4; // the pool that must be the first hop
+  string pool_type    = 5; // "v2" or "v3"
+  string token0       = 6; // pool's token0
+  string token1       = 7; // pool's token1
+  uint32 fee_tier     = 8;
+}
+
+message ComputePoolPathResponse {
+  SwapPath path = 1; // the computed path, empty if no route found
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Pool Discovery
 // ═══════════════════════════════════════════════════════════════
@@ -224,14 +242,15 @@ message PoolInfo {
   string token1       = 5;
   uint32 fee_tier     = 6; // v3 fee in bps (500, 3000, 10000), 0 for v2
   // V2: token reserves (decimal strings adjusted for token decimals)
-  string reserve0     = 7;
-  string reserve1     = 8;
+  string reserve0 = 7;
+  string reserve1 = 8;
   // V3: liquidity (raw uint128 as string) and token balances in pool
-  string liquidity    = 9;
-  string balance0     = 10;
-  string balance1     = 11;
+  string liquidity        = 9;
+  string balance0         = 10;
+  string balance1         = 11;
   double token0_price_usd = 12;
   double token1_price_usd = 13;
+  string swap_path_json   = 14; // per-pool swap route (JSON-encoded SwapPath)
 }
 
 // ═══════════════════════════════════════════════════════════════
