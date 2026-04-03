@@ -30,6 +30,7 @@ pub struct BaseToken {
 pub struct DexFactoryConfig {
     pub name: String,
     pub factory_address: String,
+    pub router_address: String,
     pub pool_type: PoolTypeConfig,
     #[serde(default)]
     pub fee_tiers: Vec<u32>,

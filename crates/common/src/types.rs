@@ -56,3 +56,42 @@ pub fn base_tokens_for_chain(chain: &str) -> Vec<String> {
         .map(|c| c.base_tokens.iter().map(|t| t.address.clone()).collect())
         .unwrap_or_default()
 }
+
+/// Parse pool type string as stored in API/proto payloads.
+pub fn pool_type_from_str(value: &str) -> Option<PoolType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "v2" => Some(PoolType::V2),
+        "v3" => Some(PoolType::V3),
+        _ => None,
+    }
+}
+
+/// Resolve configured DEX entry for a chain, DEX name, and pool type.
+pub fn dex_config_for_chain(
+    chain: &str,
+    dex_name: &str,
+    pool_type: PoolType,
+) -> Option<DexFactoryConfig> {
+    let settings = Settings::global();
+    settings
+        .chains
+        .get(chain)
+        .filter(|c| c.enabled)
+        .and_then(|c| {
+            c.dex_factories
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(dex_name) && d.pool_type == pool_type)
+                .cloned()
+        })
+}
+
+/// Resolve the configured router for a chain/DEX/pool-type triple.
+pub fn dex_router_for_chain(chain: &str, dex_name: &str, pool_type: PoolType) -> Option<String> {
+    let dex = dex_config_for_chain(chain, dex_name, pool_type)?;
+    let router = dex.router_address.trim();
+    if router.is_empty() {
+        None
+    } else {
+        Some(router.to_string())
+    }
+}

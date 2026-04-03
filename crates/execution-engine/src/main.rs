@@ -1,11 +1,14 @@
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use anyhow::{Context, Result};
 use common::{
     proto::{
         session_service_client::SessionServiceClient, wallet_kms_client::WalletKmsClient,
         ActiveSessionsQuery, SessionInfo, SignTransactionRequest,
     },
-    types::{DexSwapEvent, SUBJECT_DEX_SWAPS, SUBJECT_TRADES_COMPLETED},
+    types::{
+        dex_router_for_chain, pool_type_from_str, DexSwapEvent, SUBJECT_DEX_SWAPS,
+        SUBJECT_TRADES_COMPLETED,
+    },
 };
 use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
@@ -223,9 +226,55 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             "Executing POV trade"
         );
 
+        let Some(pool_cfg) = session
+            .pools
+            .iter()
+            .find(|p| p.pool_address.eq_ignore_ascii_case(&event.pool_address))
+        else {
+            warn!(
+                session_id = %session.session_id,
+                pool = %event.pool_address,
+                "Skipping trade: pool metadata missing from session"
+            );
+            continue;
+        };
+
+        let Some(pool_type) = pool_type_from_str(&pool_cfg.pool_type) else {
+            warn!(
+                session_id = %session.session_id,
+                pool = %event.pool_address,
+                pool_type = %pool_cfg.pool_type,
+                "Skipping trade: unsupported pool type"
+            );
+            continue;
+        };
+
+        let Some(router_address) =
+            dex_router_for_chain(&session.chain, &pool_cfg.dex_name, pool_type)
+        else {
+            warn!(
+                session_id = %session.session_id,
+                chain = %session.chain,
+                dex = %pool_cfg.dex_name,
+                pool_type = %pool_cfg.pool_type,
+                "Skipping trade: no configured router for chain/dex/pool_type"
+            );
+            continue;
+        };
+
+        let Ok(router_address) = router_address.parse::<Address>() else {
+            warn!(
+                session_id = %session.session_id,
+                chain = %session.chain,
+                dex = %pool_cfg.dex_name,
+                "Skipping trade: configured router address is invalid"
+            );
+            continue;
+        };
+
         // 5. Build and sign the transaction via KMS
         // In production, this builds a proper DEX router call or direct pool swap
-        let tx_bytes = build_swap_calldata(&event.pool_address, sell_amount);
+        let tx_bytes = build_swap_calldata(router_address, sell_amount);
 
         let mut kms_client = state.kms_client.clone();
         let sign_response = kms_client
@@ -302,13 +351,15 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
-/// Build swap calldata for a direct pool swap.
+/// Build swap calldata for a router swap target.
 /// In production, this would encode the proper function selector + args.
-fn build_swap_calldata(pool_address: &str, amount: U256) -> Vec<u8> {
-    // Placeholder: production builds proper ABI-encoded calldata
-    let mut data = Vec::with_capacity(68);
+fn build_swap_calldata(router_address: Address, amount: U256) -> Vec<u8> {
+    // Placeholder: production builds proper ABI-encoded calldata.
+    // We include the resolved router to ensure swaps target routers, not pools.
+    let mut data = Vec::with_capacity(88);
     // swap(uint256) selector placeholder
     data.extend_from_slice(&[0x01, 0x23, 0x45, 0x67]);
+    data.extend_from_slice(router_address.as_slice());
     data.extend_from_slice(&amount.to_be_bytes::<32>());
     data
 }
