@@ -1,0 +1,31 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules/
+.next/
+out/
+frontend/.env.local
+
+# Environment
+.env
+*.env.local
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+postgres-data/
+redis-data/
+nats-data/
+reth-api-gateway-plan-backlog.md
+reth-api-gateway-plan.md
+PLACEHOLDERS.md
+.prompt

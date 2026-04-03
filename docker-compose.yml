@@ -1,0 +1,198 @@
+x-rust-service: &rust-service
+  build:
+    context: .
+    dockerfile: Dockerfile.rust
+  env_file: .env
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    nats:
+      condition: service_healthy
+  networks:
+    - liquifier-net
+
+services:
+  # ──────────────────────────────────────────────────────────────
+  # Infrastructure
+  # ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: liquifier
+      POSTGRES_USER: liquifier
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liquifier"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - liquifier-net
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme_in_production}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a $${REDIS_PASSWORD:-changeme_in_production} ping | grep PONG",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - liquifier-net
+
+  nats:
+    image: nats:2.10-alpine
+    command: >
+      -js
+      -sd /data
+      -m 8222
+    # ports:
+    #   - "4222:4222"
+    #   - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - liquifier-net
+
+  # ──────────────────────────────────────────────────────────────
+  # Service 1: API Gateway & Auth
+  # ──────────────────────────────────────────────────────────────
+  api-gateway:
+    <<: *rust-service
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        SERVICE_NAME: api-gateway
+    ports:
+      - "8082:8080"
+    environment:
+      RUST_LOG: info,api_gateway=debug
+
+  # ──────────────────────────────────────────────────────────────
+  # Service 2: Wallet & Key Management Service (KMS)
+  # ──────────────────────────────────────────────────────────────
+  kms:
+    <<: *rust-service
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        SERVICE_NAME: kms
+    # NO ports exposed — internal gRPC only
+    environment:
+      RUST_LOG: info,kms=debug
+
+  # ──────────────────────────────────────────────────────────────
+  # Service 3: Session API & Routing Service
+  # ──────────────────────────────────────────────────────────────
+  session-api:
+    <<: *rust-service
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        SERVICE_NAME: session-api
+    environment:
+      RUST_LOG: info,session_api=debug
+
+  # ──────────────────────────────────────────────────────────────
+  # Service 4: Central Indexer (Web3 Ingestion)
+  # ──────────────────────────────────────────────────────────────
+  indexer:
+    <<: *rust-service
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        SERVICE_NAME: indexer
+    environment:
+      RUST_LOG: info,indexer=debug
+
+  # ──────────────────────────────────────────────────────────────
+  # Service 5: Execution Engine (Workers)
+  # ──────────────────────────────────────────────────────────────
+  execution-engine:
+    <<: *rust-service
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        SERVICE_NAME: execution-engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      kms:
+        condition: service_started
+      session-api:
+        condition: service_started
+    deploy:
+      replicas: 2
+    environment:
+      RUST_LOG: info,execution_engine=debug
+
+  # ──────────────────────────────────────────────────────────────
+  # Service 6: WebSocket / Real-Time Metrics
+  # ──────────────────────────────────────────────────────────────
+  websocket-service:
+    <<: *rust-service
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      args:
+        SERVICE_NAME: websocket-service
+    ports:
+      - "8083:8081"
+    environment:
+      RUST_LOG: info,websocket_service=debug
+
+  # ──────────────────────────────────────────────────────────────
+  # Next.js Frontend
+  # ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8082
+        NEXT_PUBLIC_WS_URL: ws://localhost:8083
+    ports:
+      - "3001:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8082
+      NEXT_PUBLIC_WS_URL: ws://localhost:8083
+    depends_on:
+      - api-gateway
+      - websocket-service
+    networks:
+      - liquifier-net
+
+volumes:
+  postgres-data:
+  redis-data:
+  nats-data:
+
+networks:
+  liquifier-net:
+    driver: bridge

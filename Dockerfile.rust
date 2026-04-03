@@ -1,0 +1,38 @@
+# Rust build stage
+FROM rust:1.94.1-bookworm AS builder
+
+ARG SERVICE_NAME
+
+WORKDIR /app
+
+# Install protobuf compiler for tonic/prost proto compilation
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy full workspace (BuildKit cache mount handles incremental builds)
+COPY Cargo.toml Cargo.lock ./
+COPY proto/ proto/
+COPY config/ config/
+COPY crates/ crates/
+COPY migrations/ migrations/
+
+# Build with BuildKit cache mounts for Cargo registry + target dir.
+# sharing=locked prevents parallel builds from corrupting the shared cache.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo build --release --package ${SERVICE_NAME} && \
+    cp /app/target/release/${SERVICE_NAME} /usr/local/bin/service
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/service /usr/local/bin/service
+
+EXPOSE 8080 50051 50052 50053 8081
+
+CMD ["service"]

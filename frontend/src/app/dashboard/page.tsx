@@ -1,0 +1,234 @@
+"use client";
+
+import Link from "next/link";
+import { useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { cn, shortenAddress } from "@/lib/utils";
+import type { SessionStatus } from "@/lib/types";
+
+export default function DashboardPage() {
+  const sessionsQuery = useQuery({
+    queryKey: ["sessions"],
+    queryFn: () => api.listSessions(),
+    refetchInterval: 30_000,
+  });
+
+  const walletsQuery = useQuery({
+    queryKey: ["wallets"],
+    queryFn: () => api.listWallets(),
+  });
+
+  const createWalletMutation = useMutation({
+    mutationFn: () => api.createWallet(),
+    onSuccess: () => walletsQuery.refetch(),
+  });
+
+  const [exportedKey, setExportedKey] = useState<{
+    walletId: string;
+    privateKey: string;
+    address: string;
+  } | null>(null);
+  const [exportingId, setExportingId] = useState<string | null>(null);
+
+  const handleExport = async (walletId: string) => {
+    setExportingId(walletId);
+    try {
+      const res = await api.exportWallet(walletId);
+      setExportedKey({ walletId, privateKey: res.private_key, address: res.address });
+    } finally {
+      setExportingId(null);
+    }
+  };
+
+  const sessions = sessionsQuery.data?.sessions ?? [];
+  const wallets = walletsQuery.data?.wallets ?? [];
+
+  return (
+    <main className="min-h-screen p-8 max-w-5xl mx-auto">
+      <div className="flex items-center justify-between mb-8">
+        <h1 className="text-3xl font-bold">Dashboard</h1>
+        <div className="flex gap-2">
+          <Link href="/dashboard/settings">
+            <Button variant="secondary">Settings</Button>
+          </Link>
+          <Link href="/sessions/new">
+            <Button>New Session</Button>
+          </Link>
+        </div>
+      </div>
+
+      {sessionsQuery.isLoading && (
+        <p className="text-muted-foreground">Loading sessions...</p>
+      )}
+
+      {/* ── Wallets ──────────────────────────────────────── */}
+      <Card className="mb-8">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle>Wallets</CardTitle>
+          <Button
+            size="sm"
+            onClick={() => createWalletMutation.mutate()}
+            disabled={createWalletMutation.isPending}
+          >
+            {createWalletMutation.isPending ? "Creating..." : "Create Wallet"}
+          </Button>
+        </CardHeader>
+        <CardContent>
+          {wallets.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No wallets yet. Create one to get started.</p>
+          ) : (
+            <div className="space-y-2">
+              {wallets.map((w) => (
+                <div
+                  key={w.wallet_id}
+                  className="flex items-center justify-between p-3 rounded-lg bg-muted/50"
+                >
+                  <div>
+                    <code className="text-sm">{w.address}</code>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Created {new Date(w.created_at).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleExport(w.wallet_id)}
+                    disabled={exportingId === w.wallet_id}
+                  >
+                    {exportingId === w.wallet_id ? "Exporting..." : "Backup"}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Export modal */}
+          {exportedKey && (
+            <div className="mt-4 p-4 rounded-lg border border-amber-500/50 bg-amber-500/5 space-y-2">
+              <p className="text-sm font-medium text-amber-500">
+                ⚠ Private Key — store this securely and never share it
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="text-xs break-all flex-1 select-all bg-muted p-2 rounded">
+                  {exportedKey.privateKey}
+                </code>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    navigator.clipboard.writeText(exportedKey.privateKey);
+                  }}
+                >
+                  Copy
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Address: {exportedKey.address}
+              </p>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setExportedKey(null)}
+              >
+                Dismiss
+              </Button>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Sessions ─────────────────────────────────────── */}
+
+      {sessions.length === 0 && !sessionsQuery.isLoading && (
+        <Card>
+          <CardContent className="py-12 text-center">
+            <p className="text-muted-foreground mb-4">No sessions yet.</p>
+            <Link href="/sessions/new">
+              <Button>Create Your First Session</Button>
+            </Link>
+          </CardContent>
+        </Card>
+      )}
+
+      <div className="grid gap-4">
+        {sessions.map((session) => {
+          const status = session.status as SessionStatus;
+          const progress =
+            session.total_amount !== "0"
+              ? Number(
+                  (BigInt(session.amount_sold) * 10000n) /
+                    BigInt(session.total_amount)
+                ) / 100
+              : 0;
+
+          return (
+            <Link
+              key={session.session_id}
+              href={`/sessions/${session.session_id}`}
+            >
+              <Card className="hover:border-primary/50 transition-colors cursor-pointer">
+                <CardContent className="py-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-4">
+                      <div>
+                        <p className="font-semibold">
+                          {session.sell_token_symbol} →{" "}
+                          {session.target_token_symbol}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          {session.chain} ·{" "}
+                          {shortenAddress(session.session_id)}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-6">
+                      <div className="text-right">
+                        <p className="text-sm font-mono">
+                          {progress.toFixed(1)}%
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          POV {session.pov_percent}%
+                        </p>
+                      </div>
+
+                      <span
+                        className={cn(
+                          "px-2.5 py-0.5 rounded-full text-xs font-medium",
+                          status === "active" &&
+                            "bg-green-500/10 text-green-500",
+                          status === "paused" &&
+                            "bg-yellow-500/10 text-yellow-500",
+                          status === "completed" &&
+                            "bg-blue-500/10 text-blue-500",
+                          status === "cancelled" &&
+                            "bg-red-500/10 text-red-500",
+                          status === "pending" &&
+                            "bg-muted text-muted-foreground",
+                          status === "error" && "bg-red-500/10 text-red-500"
+                        )}
+                      >
+                        {status.toUpperCase()}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Progress bar */}
+                  <div className="mt-3 w-full h-1 bg-secondary rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-primary rounded-full transition-all"
+                      style={{ width: `${Math.min(progress, 100)}%` }}
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+            </Link>
+          );
+        })}
+      </div>
+    </main>
+  );
+}

@@ -1,0 +1,6 @@
+# Production overrides — set sensitive values via APP__* env vars
+application:
+  environment: production
+
+database:
+  max_connections: 25

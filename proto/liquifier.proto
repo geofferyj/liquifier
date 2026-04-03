@@ -1,0 +1,290 @@
+syntax = "proto3";
+
+package liquifier;
+
+// ═══════════════════════════════════════════════════════════════
+// Wallet & Key Management Service (KMS)
+// ═══════════════════════════════════════════════════════════════
+
+service WalletKms {
+    // Generate a new wallet for a user on a specific chain
+  rpc CreateWallet(CreateWalletRequest) returns (CreateWalletResponse);
+
+    // Get wallet public info
+  rpc GetWallet(GetWalletRequest) returns (WalletInfo);
+
+    // List wallets for a user
+  rpc ListWallets(ListWalletsRequest) returns (ListWalletsResponse);
+
+    // Get native + ERC-20 balance
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+
+    // Sign a raw transaction (key decrypted only in memory)
+  rpc SignTransaction(SignTransactionRequest) returns (SignTransactionResponse);
+
+    // Export private key (decrypted) — requires ownership verification
+  rpc ExportPrivateKey(ExportPrivateKeyRequest) returns (ExportPrivateKeyResponse);
+}
+
+message CreateWalletRequest {
+  string user_id = 1;
+  string chain   = 2; // deprecated — kept for compat, always "ethereum"
+}
+
+message CreateWalletResponse {
+  string wallet_id = 1;
+  string address   = 2;
+}
+
+message GetWalletRequest {
+  string wallet_id = 1;
+}
+
+message ListWalletsRequest {
+  string user_id = 1;
+}
+
+message ListWalletsResponse {
+  repeated WalletInfo wallets = 1;
+}
+
+message WalletInfo {
+  string wallet_id  = 1;
+  string address    = 2;
+  string chain      = 3;
+  string created_at = 4;
+}
+
+message GetBalanceRequest {
+  string wallet_id     = 1;
+  string token_address = 2; // empty = native gas token
+  string rpc_url       = 3; // optional override
+}
+
+message GetBalanceResponse {
+  string balance  = 1; // decimal string
+  uint32 decimals = 2;
+}
+
+message SignTransactionRequest {
+  string wallet_id   = 1;
+  bytes  unsigned_tx = 2; // RLP-encoded unsigned transaction
+  uint64 chain_id    = 3;
+}
+
+message SignTransactionResponse {
+  bytes  signed_tx = 1; // RLP-encoded signed transaction
+  string tx_hash   = 2;
+}
+
+message ExportPrivateKeyRequest {
+  string wallet_id = 1;
+  string user_id   = 2; // ownership check
+}
+
+message ExportPrivateKeyResponse {
+  string private_key = 1; // hex-encoded with 0x prefix
+  string address     = 2;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Session API & Routing Service
+// ═══════════════════════════════════════════════════════════════
+
+service SessionService {
+    // CRUD
+  rpc CreateSession(CreateSessionRequest) returns (SessionInfo);
+  rpc GetSession(GetSessionRequest) returns (SessionInfo);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc UpdateSessionStatus(UpdateSessionStatusRequest) returns (SessionInfo);
+  rpc UpdateSessionConfig(UpdateSessionConfigRequest) returns (SessionInfo);
+  rpc TogglePublicSharing(TogglePublicSharingRequest) returns (SessionInfo);
+  rpc GetSessionBySlug(GetSessionBySlugRequest) returns (SessionInfo);
+
+    // Pool discovery
+  rpc DiscoverPools(DiscoverPoolsRequest) returns (DiscoverPoolsResponse);
+
+    // Routing
+  rpc GetSwapPaths(GetSwapPathsRequest) returns (GetSwapPathsResponse);
+
+    // Query active sessions (used by Execution Engine)
+  rpc GetActiveSessionsForToken(ActiveSessionsQuery) returns (ActiveSessionsResponse);
+}
+
+message CreateSessionRequest {
+  string            user_id               = 1;
+  string            wallet_id             = 2;
+  string            chain                 = 3;
+  string            sell_token            = 4;
+  string            sell_token_symbol     = 5;
+  uint32            sell_token_decimals   = 6;
+  string            target_token          = 7;
+  string            target_token_symbol   = 8;
+  uint32            target_token_decimals = 9;
+  string            strategy              = 10; // "pov"
+  string            total_amount          = 11; // U256 as decimal string
+  double            pov_percent           = 12;
+  double            max_price_impact      = 13;
+  double            min_buy_trigger_usd   = 14;
+  string            swap_path_json        = 15; // selected path as JSON
+  repeated PoolInfo pools                 = 16; // discovered pools to watch
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message ListSessionsRequest {
+  string user_id = 1;
+}
+
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;
+}
+
+message UpdateSessionStatusRequest {
+  string session_id = 1;
+  string status     = 2; // "active", "paused", "cancelled"
+}
+
+message SessionInfo {
+  string            session_id             = 1;
+  string            user_id                = 2;
+  string            wallet_id              = 3;
+  string            chain                  = 4;
+  string            status                 = 5;
+  string            sell_token             = 6;
+  string            sell_token_symbol      = 7;
+  uint32            sell_token_decimals    = 8;
+  string            target_token           = 9;
+  string            target_token_symbol    = 10;
+  uint32            target_token_decimals  = 11;
+  string            strategy               = 12;
+  string            total_amount           = 13;
+  string            amount_sold            = 14;
+  double            pov_percent            = 15;
+  double            max_price_impact       = 16;
+  double            min_buy_trigger_usd    = 17;
+  string            swap_path_json         = 18;
+  string            public_slug            = 19;
+  bool              public_sharing_enabled = 23;
+  string            created_at             = 20;
+  string            updated_at             = 21;
+  repeated PoolInfo pools                  = 22; // pools associated with this session
+}
+
+message GetSwapPathsRequest {
+  string chain        = 1;
+  string sell_token   = 2;
+  string target_token = 3;
+  string amount       = 4; // for quote estimation
+}
+
+message SwapPath {
+  uint32          rank                   = 1;
+  repeated string hops                   = 2; // list of pool addresses
+  repeated string hop_tokens             = 3; // intermediate tokens
+  string          estimated_output       = 4;
+  double          estimated_price_impact = 5;
+  double          fee_percent            = 6;
+}
+
+message GetSwapPathsResponse {
+  repeated SwapPath paths = 1;
+}
+
+message ActiveSessionsQuery {
+  string chain         = 1;
+  string token_address = 2; // the sell_token to match (optional if pool_address set)
+  string pool_address  = 3; // match sessions watching this pool (optional if token_address set)
+}
+
+message ActiveSessionsResponse {
+  repeated SessionInfo sessions = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pool Discovery
+// ═══════════════════════════════════════════════════════════════
+
+message DiscoverPoolsRequest {
+  string chain         = 1;
+  string token_address = 2; // token to find pools for
+}
+
+message DiscoverPoolsResponse {
+  repeated PoolInfo pools = 1;
+}
+
+message PoolInfo {
+  string pool_address = 1;
+  string pool_type    = 2; // "v2" or "v3"
+  string dex_name     = 3; // e.g. "uniswap", "sushiswap"
+  string token0       = 4;
+  string token1       = 5;
+  uint32 fee_tier     = 6; // v3 fee in bps (500, 3000, 10000), 0 for v2
+  // V2: token reserves (decimal strings adjusted for token decimals)
+  string reserve0     = 7;
+  string reserve1     = 8;
+  // V3: liquidity (raw uint128 as string) and token balances in pool
+  string liquidity    = 9;
+  string balance0     = 10;
+  string balance1     = 11;
+  double token0_price_usd = 12;
+  double token1_price_usd = 13;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WebSocket / Metrics Service (internal gRPC)
+// ═══════════════════════════════════════════════════════════════
+
+service MetricsService {
+    // Push a session update for broadcast
+  rpc PushSessionUpdate(SessionUpdateEvent) returns (PushAck);
+
+    // Push a completed trade for broadcast
+  rpc PushTradeCompleted(TradeCompletedEvent) returns (PushAck);
+}
+
+message SessionUpdateEvent {
+  string session_id          = 1;
+  string status              = 2;
+  string amount_sold         = 3;
+  string remaining           = 4;
+  string converted_value_usd = 5;
+}
+
+message TradeCompletedEvent {
+  string trade_id         = 1;
+  string session_id       = 2;
+  string chain            = 3;
+  string sell_amount      = 4;
+  string received_amount  = 5;
+  string tx_hash          = 6;
+  uint32 price_impact_bps = 7;
+  string executed_at      = 8;
+}
+
+message PushAck {
+  bool ok = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Session config update / sharing
+// ═══════════════════════════════════════════════════════════════
+
+message UpdateSessionConfigRequest {
+  string session_id          = 1;
+  double pov_percent         = 2;
+  double max_price_impact    = 3;
+  double min_buy_trigger_usd = 4;
+}
+
+message TogglePublicSharingRequest {
+  string session_id = 1;
+  bool   enabled    = 2;
+}
+
+message GetSessionBySlugRequest {
+  string slug = 1;
+}
