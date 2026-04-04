@@ -264,6 +264,12 @@ export default function SessionCreatePage() {
   const sellDecimals = form.sellTokenMeta?.decimals ?? 18;
   const balanceHuman = walletBalanceWei ? fromWei(walletBalanceWei, sellDecimals) : null;
 
+  const amountExceedsBalance =
+    !!walletBalanceWei &&
+    !!form.totalAmount &&
+    !isNaN(Number(form.totalAmount)) &&
+    BigInt(toWei(form.totalAmount, sellDecimals)) > BigInt(walletBalanceWei);
+
   const setAmountPercent = (pct: number) => {
     if (!walletBalanceWei) return;
     const raw = (BigInt(walletBalanceWei) * BigInt(pct)) / BigInt(100);
@@ -460,6 +466,7 @@ export default function SessionCreatePage() {
     isValidAddress(form.sellToken) &&
     isValidAddress(form.targetToken) &&
     !!form.totalAmount &&
+    !amountExceedsBalance &&
     !form.sellTokenMeta?.loading &&
     !form.sellTokenMeta?.error &&
     !form.targetTokenMeta?.loading &&
@@ -627,6 +634,11 @@ export default function SessionCreatePage() {
                   </span>
                 )}
               </div>
+              {amountExceedsBalance && (
+                <p className="text-xs text-destructive mt-1">
+                  Amount exceeds wallet balance of {balanceHuman} {form.sellTokenMeta?.symbol ?? ""}
+                </p>
+              )}
             </div>
 
             {/* Advanced Settings — inline on step 0 */}

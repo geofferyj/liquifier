@@ -29,6 +29,10 @@ pub const NATIVE_TOKEN_PLACEHOLDER: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 /// Wrapped native token address for BSC.
 pub const BSC_WBNB_ADDRESS: &str = "0xbb4cdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 
+const WRAPPED_NATIVE_SYMBOLS: [&str; 11] = [
+    "WETH", "WBNB", "WMATIC", "WAVAX", "WFTM", "WONE", "WCELO", "WGLMR", "WKLAY", "WOKT", "WSEI",
+];
+
 // Re-export config chain types so existing consumers keep compiling
 pub use liquifier_config::{
     chain_name_to_id, enabled_chains, get_chain, ChainConfig, DexFactoryConfig,
@@ -109,22 +113,175 @@ pub fn is_native_token_placeholder(address: &str) -> bool {
         .eq_ignore_ascii_case(NATIVE_TOKEN_PLACEHOLDER)
 }
 
+/// Resolve the wrapped-native token address configured for a chain.
+pub fn wrapped_native_token_for_chain(chain: &str) -> Option<String> {
+    let settings = Settings::global();
+    let chain_cfg = settings.chains.get(chain)?;
+
+    chain_cfg
+        .base_tokens
+        .iter()
+        .find(|token| {
+            let symbol = token.symbol.trim().to_ascii_uppercase();
+            WRAPPED_NATIVE_SYMBOLS.contains(&symbol.as_str())
+        })
+        .map(|token| token.address.clone())
+}
+
 /// Normalize user-facing token addresses into process-safe addresses.
-/// For now, only BSC native placeholder is mapped to WBNB.
+/// Native placeholders are mapped to each chain's configured wrapped-native token.
 pub fn normalize_token_for_chain(chain: &str, token_address: &str) -> String {
     let token = token_address.trim();
-    if chain.eq_ignore_ascii_case("bsc") && is_native_token_placeholder(token) {
-        return BSC_WBNB_ADDRESS.to_string();
+    if is_native_token_placeholder(token) {
+        if let Some(wrapped_native) = wrapped_native_token_for_chain(chain) {
+            return wrapped_native;
+        }
     }
     token.to_string()
 }
 
 /// Convert process-safe token addresses back to UI-facing representation.
-/// For now, only WBNB on BSC is mapped back to the native placeholder.
+/// Wrapped-native addresses are mapped back to the native placeholder.
 pub fn display_token_for_chain(chain: &str, token_address: &str) -> String {
     let token = token_address.trim();
-    if chain.eq_ignore_ascii_case("bsc") && token.eq_ignore_ascii_case(BSC_WBNB_ADDRESS) {
-        return NATIVE_TOKEN_PLACEHOLDER.to_string();
+    if let Some(wrapped_native) = wrapped_native_token_for_chain(chain) {
+        if token.eq_ignore_ascii_case(&wrapped_native) {
+            return NATIVE_TOKEN_PLACEHOLDER.to_string();
+        }
     }
     token.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── pool_type_from_str ──────────────────────────────────
+    #[test]
+    fn test_pool_type_from_str_v2() {
+        assert_eq!(pool_type_from_str("v2"), Some(PoolType::V2));
+    }
+
+    #[test]
+    fn test_pool_type_from_str_v3() {
+        assert_eq!(pool_type_from_str("v3"), Some(PoolType::V3));
+    }
+
+    #[test]
+    fn test_pool_type_from_str_uppercase() {
+        assert_eq!(pool_type_from_str("V2"), Some(PoolType::V2));
+        assert_eq!(pool_type_from_str("V3"), Some(PoolType::V3));
+    }
+
+    #[test]
+    fn test_pool_type_from_str_with_whitespace() {
+        assert_eq!(pool_type_from_str("  v2  "), Some(PoolType::V2));
+    }
+
+    #[test]
+    fn test_pool_type_from_str_invalid() {
+        assert_eq!(pool_type_from_str("v4"), None);
+        assert_eq!(pool_type_from_str(""), None);
+        assert_eq!(pool_type_from_str("uniswap"), None);
+    }
+
+    // ── is_native_token_placeholder ─────────────────────────
+    #[test]
+    fn test_is_native_placeholder_true() {
+        assert!(is_native_token_placeholder(NATIVE_TOKEN_PLACEHOLDER));
+    }
+
+    #[test]
+    fn test_is_native_placeholder_uppercase() {
+        assert!(is_native_token_placeholder(
+            "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+        ));
+    }
+
+    #[test]
+    fn test_is_native_placeholder_with_whitespace() {
+        assert!(is_native_token_placeholder(
+            "  0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee  "
+        ));
+    }
+
+    #[test]
+    fn test_is_native_placeholder_false() {
+        assert!(!is_native_token_placeholder(
+            "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+        ));
+        assert!(!is_native_token_placeholder(""));
+        assert!(!is_native_token_placeholder(
+            "0x0000000000000000000000000000000000000000"
+        ));
+    }
+
+    // ── DexSwapEvent serialization ──────────────────────────
+    #[test]
+    fn test_dex_swap_event_serialize_deserialize() {
+        let event = DexSwapEvent {
+            chain: "bsc".to_string(),
+            block_number: 12345678,
+            tx_hash: "0xabc".to_string(),
+            log_index: 0,
+            pool_address: "0x123".to_string(),
+            dex_type: "uniswap_v2".to_string(),
+            token_in: "0xtoken_in".to_string(),
+            token_out: "0xtoken_out".to_string(),
+            amount_in: "1000".to_string(),
+            amount_out: "500".to_string(),
+            sender: "0xsender".to_string(),
+            recipient: "0xrecipient".to_string(),
+            timestamp: 1700000000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: DexSwapEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.chain, "bsc");
+        assert_eq!(deserialized.block_number, 12345678);
+        assert_eq!(deserialized.amount_in, "1000");
+        assert_eq!(deserialized.timestamp, 1700000000);
+    }
+
+    #[test]
+    fn test_dex_swap_event_from_json() {
+        let json = r#"{
+            "chain": "ethereum",
+            "block_number": 100,
+            "tx_hash": "0x1",
+            "log_index": 5,
+            "pool_address": "0xpool",
+            "dex_type": "uniswap_v3",
+            "token_in": "",
+            "token_out": "",
+            "amount_in": "0",
+            "amount_out": "0",
+            "sender": "0xs",
+            "recipient": "0xr",
+            "timestamp": 0
+        }"#;
+        let event: DexSwapEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.chain, "ethereum");
+        assert_eq!(event.log_index, 5);
+        assert_eq!(event.dex_type, "uniswap_v3");
+    }
+
+    // ── Constants ───────────────────────────────────────────
+    #[test]
+    fn test_nats_subject_constants() {
+        assert_eq!(SUBJECT_DEX_SWAPS, "evm.dex.swaps");
+        assert_eq!(SUBJECT_TRADES_COMPLETED, "trades.completed");
+        assert_eq!(SUBJECT_SESSION_UPDATES, "session.updates");
+    }
+
+    #[test]
+    fn test_native_token_placeholder_format() {
+        assert!(NATIVE_TOKEN_PLACEHOLDER.starts_with("0x"));
+        assert_eq!(NATIVE_TOKEN_PLACEHOLDER.len(), 42);
+    }
+
+    #[test]
+    fn test_bsc_wbnb_address_format() {
+        assert!(BSC_WBNB_ADDRESS.starts_with("0x"));
+        assert_eq!(BSC_WBNB_ADDRESS.len(), 42);
+    }
 }

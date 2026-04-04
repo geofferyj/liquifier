@@ -7,7 +7,10 @@ use alloy::{
 use anyhow::{Context, Result};
 use common::types::{DexSwapEvent, SUBJECT_DEX_SWAPS};
 use futures::StreamExt;
-use tracing::{error, info, warn};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 mod parser;
 
@@ -31,6 +34,10 @@ sol! {
     }
 }
 
+/// Cache of pool address -> Option<(token0, token1)>.
+/// `None` means we already tried and the address is not a valid pool.
+type TokenCache = Arc<RwLock<HashMap<Address, Option<(Address, Address)>>>>;
+
 // ─────────────────────────────────────────────────────────────
 // Chain configuration
 // ─────────────────────────────────────────────────────────────
@@ -49,7 +56,10 @@ async fn main() -> Result<()> {
     // Initialize global config (loads config/default.yml + env overrides)
     liquifier_config::Settings::init().expect("Failed to load config");
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("alloy_transport_ws=warn".parse().unwrap()),
+        )
         // .json()
         .init();
 
@@ -95,9 +105,10 @@ async fn main() -> Result<()> {
     let mut handles = Vec::new();
     for chain in chains {
         let js = jetstream.clone();
+        let token_cache: TokenCache = Arc::new(RwLock::new(HashMap::new()));
         let handle = tokio::spawn(async move {
             loop {
-                match index_chain(&chain.name, &chain.ws_url, &js).await {
+                match index_chain(&chain.name, &chain.ws_url, &js, &token_cache).await {
                     Ok(()) => {
                         warn!(chain = %chain.name, "Indexer stream ended, reconnecting in 5s...");
                     }
@@ -124,6 +135,7 @@ async fn index_chain(
     chain_name: &str,
     ws_url: &str,
     jetstream: &async_nats::jetstream::Context,
+    token_cache: &TokenCache,
 ) -> Result<()> {
     info!(chain = %chain_name, "Connecting to EVM WebSocket...");
 
@@ -141,8 +153,10 @@ async fn index_chain(
     while let Some(log) = stream.next().await {
         match parser::parse_swap_log(chain_name, &log) {
             Ok(Some(mut event)) => {
-                if let Err(e) = resolve_tokens_for_event(&provider, &log, &mut event).await {
-                    warn!(
+                if let Err(e) =
+                    resolve_tokens_for_event(&provider, &log, &mut event, token_cache).await
+                {
+                    debug!(
                         chain = %chain_name,
                         pool = %event.pool_address,
                         error = %e,
@@ -172,11 +186,44 @@ async fn resolve_tokens_for_event<P: Provider + Clone>(
     provider: &P,
     log: &Log,
     event: &mut DexSwapEvent,
+    token_cache: &TokenCache,
 ) -> Result<()> {
     let pool = log.address();
-    let pool_contract = IPoolTokens::new(pool, provider.clone());
-    let token0 = Address::from(pool_contract.token0().call().await?.0);
-    let token1 = Address::from(pool_contract.token1().call().await?.0);
+
+    // Check cache first
+    let cached = {
+        let cache = token_cache.read().await;
+        cache.get(&pool).copied()
+    };
+
+    let (token0, token1) = match cached {
+        Some(Some(pair)) => pair,
+        Some(None) => {
+            // Previously failed — this address is not a valid pool
+            anyhow::bail!("address previously identified as non-pool");
+        }
+        None => {
+            // Not in cache — query on-chain
+            let pool_contract = IPoolTokens::new(pool, provider.clone());
+            match (
+                pool_contract.token0().call().await,
+                pool_contract.token1().call().await,
+            ) {
+                (Ok(t0), Ok(t1)) => {
+                    let pair = (Address::from(t0.0), Address::from(t1.0));
+                    token_cache.write().await.insert(pool, Some(pair));
+                    pair
+                }
+                _ => {
+                    // Mark as non-pool so we don't retry
+                    token_cache.write().await.insert(pool, None);
+                    anyhow::bail!(
+                        "contract call to `token0`/`token1` failed; address is likely not a pool"
+                    );
+                }
+            }
+        }
+    };
 
     let data = log.data().data.as_ref();
     match event.dex_type.as_str() {

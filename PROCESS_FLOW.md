@@ -205,13 +205,13 @@ If no sessions match, processing stops (returns `Ok(())`).
 
 **Step 2 — For Each Matching Session:**
 
-**2a. Minimum Buy Trigger Check:- TODO(add price oracle integration)**
+**2a. Minimum Buy Trigger Check (Oracle-Backed)**
 
-Computes a simplified USD threshold check:
+Uses the `PriceCache` (Chainlink oracle-backed, refreshed via background task) to convert the observed buy amount into a USD value:
 ```rust
-min_trigger = session.min_buy_trigger_usd × 10^18
+buy_usd = estimate_token_usd_value(price_cache, chain, token_out, buy_amount, decimals, token_in)
 ```
-If the observed `amount_out` (the buy volume) is below this threshold, skip. This prevents reacting to dust-level trades.
+If `buy_usd < session.min_buy_trigger_usd`, the trade is skipped. If no oracle price is available for the trigger token, the trade is also skipped with a warning log.
 
 **2b. POV Sell Amount Calculation**
 
@@ -226,7 +226,7 @@ The sell amount is capped at the session's remaining balance:
 remaining = total_amount - amount_sold
 sell_amount = min(sell_amount, remaining)
 ```
-If remaining is zero, skip. TODO(add session completion logic when total_amount is fully sold).
+If remaining is zero, skip.
 
 **2c. Price Impact Calculation**
 
@@ -246,32 +246,29 @@ If `price_impact_bps > min(session.max_price_impact × 100, global_max_price_imp
 
 **2d. Transaction Construction**
 
-Calls `build_swap_calldata(router_address, sell_amount, route, pool_type, fee_tier)`.
+Calls `build_swap_calldata(router_address, sell_amount, route, pool_type, fee_tier, recipient, chain, slippage_bps, price_cache)`.
 
-Current behavior:
-- V2 pools: ABI-encodes router `swapExactTokensForTokens(amountIn, amountOutMin, path, to, deadline)` using route `hop_tokens`.
+Behavior:
+- V2 pools: ABI-encodes router `swapExactTokensForTokensSupportingFeeOnTransferTokens(amountIn, amountOutMin, path, to, deadline)` using route `hop_tokens`.
 - V3 pools: ABI-encodes router `exactInput(params)` with an encoded token/fee path.
-
-Remaining production hardening:
-- set real recipient wallet address (currently placeholder recipient)
-- set non-zero slippage bounds (`amountOutMin` / `amountOutMinimum`)
-- wrap calldata into a full unsigned transaction envelope before signing/submission
+- **Slippage protection**: `amountOutMin` / `amountOutMinimum` is computed as `amount × (10000 - slippage_bps) / 10000`, guaranteeing non-zero output bounds.
+- Recipient is the session's wallet address, resolved from the `wallets` table.
 
 **2e. Transaction Signing via KMS**
 
-Calls KMS via gRPC:
+The execution engine builds a full EIP-1559 unsigned transaction envelope (nonce, gas limit, max fee, max priority fee, to, value, calldata, chain_id) and serializes it as JSON. It then calls KMS via gRPC:
 ```
 WalletKmsClient::sign_transaction(SignTransactionRequest {
     wallet_id: session.wallet_id,
-    unsigned_tx: tx_bytes,
-    chain_id: chain_name_to_id(&session.chain)  // "ethereum" → 1, "bsc" → 56, etc.
+    unsigned_tx: json_serialized_tx_request,
+    chain_id: chain_name_to_id(&session.chain)
 })
 ```
-On success, receives `SignTransactionResponse { signed_tx, tx_hash }`.
+KMS deserializes the `TransactionRequest`, reconstructs the signer from the decrypted private key, builds and signs the typed transaction, and returns the RLP-encoded signed transaction bytes along with the canonical `tx_hash`.
 
 **2f. Transaction Submission**
 
-Currently a **placeholder** — the comment indicates production would use Flashbots or MEV-Share bundles to prevent frontrunning.
+The signed transaction is submitted on-chain via `provider.send_raw_transaction(signed_tx_bytes)`. The canonical transaction hash from the RPC response is used as the trade's `sell_tx_hash`.
 
 **2g. Record Trade in Database**
 
@@ -380,7 +377,7 @@ For each matching session, also fetches its pools from `session_pools` and attac
 
 **`GetSwapPaths(GetSwapPathsRequest) → GetSwapPathsResponse`**
 
-Currently returns **mock paths** — 3 hardcoded swap paths with placeholder pool addresses. Production would query on-chain DEX routers to find optimal multi-hop routes.
+Performs on-chain route discovery using the session's sell and target tokens, discovering pools and constructing swap paths with per-pool route payloads.
 
 **`DiscoverPools(DiscoverPoolsRequest) → DiscoverPoolsResponse`**
 
@@ -668,21 +665,21 @@ This traces the exact path from an on-chain event to a recorded trade.
    - Calls Session API: `get_active_sessions_for_token({ chain: "ethereum", pool_address: "0xPOOL" })`.
    - The session-api JOINs `session_pools` to find all active sessions watching `0xPOOL`.
    - Assuming a matching active session `S` is returned:
-     - Min trigger: `amount_out >= session.min_buy_trigger_usd × 10^18` (simplified)
+     - Min trigger: uses oracle-backed `PriceCache` to compute `buy_usd` and compare against `session.min_buy_trigger_usd`
      - Sell amount: `sell_amount = amount_out × (pov_percent × 100) / 10000`
      - Remaining check: `remaining = total_amount - amount_sold > 0`
        - Price impact: `calculate_price_impact(chain, pool, pool_type, sell_token, sell_amount)` using on-chain data
-       - If impact ≤ effective max (session/global cap): builds ABI calldata, calls KMS to sign.
+       - If impact ≤ effective max (session/global cap): builds ABI calldata with slippage bounds, builds EIP-1559 tx envelope, calls KMS to sign.
 
 5. **KMS** (`sign_transaction`):
    - Fetches encrypted private key for `session.wallet_id`.
    - Decrypts with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
-   - Signs the hash with the secp256k1 key.
-   - Returns 65-byte signature (r, s, v).
+   - Deserializes the `TransactionRequest` JSON, builds and signs the typed transaction.
+   - Returns RLP-encoded signed transaction and canonical `tx_hash`.
    - Private key is dropped from memory.
 
 6. **Execution Engine** continues:
-   - (Placeholder: submits transaction on-chain)
+   - Submits signed transaction on-chain via `provider.send_raw_transaction()`.
    - Records trade in `trades` table with `status = 'submitted'` and trigger idempotency key (`trigger_tx_hash`, `trigger_pool`, `trigger_log_index`).
    - If the trigger is new, updates `sessions.amount_sold += sell_amount`; duplicates are short-circuited.
    - Attempts receipt lookup and finalizes to `confirmed`/`failed` when outcome is available (otherwise remains `submitted`).

@@ -56,11 +56,16 @@ pub struct DiscoveredPool {
     pub token0: String,
     pub token1: String,
     pub fee_tier: u32,
-    pub reserve0: String,
-    pub reserve1: String,
-    pub liquidity: String,
-    pub balance0: String,
-    pub balance1: String,
+    /// V2 reserve0 — `None` if fetching failed or not applicable.
+    pub reserve0: Option<String>,
+    /// V2 reserve1 — `None` if fetching failed or not applicable.
+    pub reserve1: Option<String>,
+    /// V3 liquidity — `None` if fetching failed or not applicable.
+    pub liquidity: Option<String>,
+    /// Token0 balance in pool — `None` if fetching failed.
+    pub balance0: Option<String>,
+    /// Token1 balance in pool — `None` if fetching failed.
+    pub balance1: Option<String>,
     pub token0_price_usd: f64,
     pub token1_price_usd: f64,
 }
@@ -192,10 +197,10 @@ async fn discover_v2_pool<P: Provider + Clone>(
 
     // Fetch reserves
     let (reserve0, reserve1) = match pair_contract.getReserves().call().await {
-        Ok(res) => (res.reserve0.to_string(), res.reserve1.to_string()),
+        Ok(res) => (Some(res.reserve0.to_string()), Some(res.reserve1.to_string())),
         Err(e) => {
             warn!(pool = %pair_addr, error = %e, "Failed to fetch V2 reserves");
-            (String::new(), String::new())
+            (None, None)
         }
     };
 
@@ -208,9 +213,9 @@ async fn discover_v2_pool<P: Provider + Clone>(
         fee_tier: 0,
         reserve0,
         reserve1,
-        liquidity: String::new(),
-        balance0: String::new(),
-        balance1: String::new(),
+        liquidity: None,
+        balance0: None,
+        balance1: None,
         token0_price_usd: 0.0,
         token1_price_usd: 0.0,
     }))
@@ -241,10 +246,10 @@ async fn discover_v3_pool<P: Provider + Clone>(
         .call()
         .await
     {
-        Ok(liq) => liq.to_string(),
+        Ok(liq) => Some(liq.to_string()),
         Err(e) => {
             warn!(pool = %pool_addr, error = %e, "Failed to fetch V3 liquidity");
-            String::new()
+            None
         }
     };
 
@@ -254,16 +259,16 @@ async fn discover_v3_pool<P: Provider + Clone>(
         .call()
         .await
     {
-        Ok(b) => b.to_string(),
-        Err(_) => String::new(),
+        Ok(b) => Some(b.to_string()),
+        Err(_) => None,
     };
     let balance1 = match IERC20::new(token_b, provider.clone())
         .balanceOf(Address::from(pool_addr))
         .call()
         .await
     {
-        Ok(b) => b.to_string(),
-        Err(_) => String::new(),
+        Ok(b) => Some(b.to_string()),
+        Err(_) => None,
     };
 
     Ok(Some(DiscoveredPool {
@@ -273,8 +278,8 @@ async fn discover_v3_pool<P: Provider + Clone>(
         token0: format!("{token_a:?}"),
         token1: format!("{token_b:?}"),
         fee_tier: fee,
-        reserve0: String::new(),
-        reserve1: String::new(),
+        reserve0: None,
+        reserve1: None,
         liquidity,
         balance0,
         balance1,
@@ -330,12 +335,28 @@ async fn fetch_base_token_prices<P: Provider + Clone>(
 /// Derive the price of the unknown token from pool reserves/balances.
 fn derive_price_from_pool(pool: &DiscoveredPool, derive_token0: bool) -> f64 {
     let (amount_known, amount_unknown, known_price) = if derive_token0 {
-        let a1 = parse_amount(&pool.reserve1).or_else(|| parse_amount(&pool.balance1));
-        let a0 = parse_amount(&pool.reserve0).or_else(|| parse_amount(&pool.balance0));
+        let a1 = pool
+            .reserve1
+            .as_deref()
+            .and_then(parse_amount)
+            .or_else(|| pool.balance1.as_deref().and_then(parse_amount));
+        let a0 = pool
+            .reserve0
+            .as_deref()
+            .and_then(parse_amount)
+            .or_else(|| pool.balance0.as_deref().and_then(parse_amount));
         (a1, a0, pool.token1_price_usd)
     } else {
-        let a0 = parse_amount(&pool.reserve0).or_else(|| parse_amount(&pool.balance0));
-        let a1 = parse_amount(&pool.reserve1).or_else(|| parse_amount(&pool.balance1));
+        let a0 = pool
+            .reserve0
+            .as_deref()
+            .and_then(parse_amount)
+            .or_else(|| pool.balance0.as_deref().and_then(parse_amount));
+        let a1 = pool
+            .reserve1
+            .as_deref()
+            .and_then(parse_amount)
+            .or_else(|| pool.balance1.as_deref().and_then(parse_amount));
         (a0, a1, pool.token0_price_usd)
     };
 

@@ -751,6 +751,31 @@ pub async fn create_session(
         })
         .collect();
 
+    // ── Check wallet balance for sell token ──
+    let mut kms_client = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let balance_resp = kms_client
+        .get_balance(GetBalanceRequest {
+            wallet_id: body.wallet_id.clone(),
+            token_address: sell_token.clone(),
+            rpc_url: String::new(),
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    let wallet_balance = balance_resp.balance.parse::<u128>().unwrap_or(0);
+    let requested_amount = body
+        .total_amount
+        .parse::<u128>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if requested_amount > wallet_balance {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let resp = client
         .create_session(CreateSessionRequest {
             user_id: user.user_id.to_string(),

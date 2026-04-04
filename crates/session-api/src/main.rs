@@ -8,10 +8,13 @@ use common::proto::{
     ListSessionsResponse, PoolInfo, SessionInfo, SwapPath, TogglePublicSharingRequest,
     UpdateSessionConfigRequest, UpdateSessionStatusRequest,
 };
+use common::types::{normalize_token_for_chain, PoolType};
 use rand::distr::Alphanumeric;
 use rand::RngExt;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::info;
@@ -271,50 +274,57 @@ impl SessionService for SessionServiceImpl {
         request: Request<GetSwapPathsRequest>,
     ) -> Result<Response<GetSwapPathsResponse>, Status> {
         let req = request.into_inner();
+        let sell_token = normalize_token_for_chain(&req.chain, &req.sell_token);
+        let target_token = normalize_token_for_chain(&req.chain, &req.target_token);
 
-        // In production, this queries on-chain DEX routers to find optimal paths.
-        // For scaffolding, return mock paths.
         info!(
             chain = %req.chain,
-            sell = %req.sell_token,
-            target = %req.target_token,
+            sell = %sell_token,
+            target = %target_token,
             "Computing swap paths"
         );
 
-        let paths = vec![
-            SwapPath {
-                rank: 1,
-                hops: vec!["0xPoolDirectA".into()],
-                hop_tokens: vec![req.sell_token.clone(), req.target_token.clone()],
-                estimated_output: req.amount.clone(),
-                estimated_price_impact: 0.15,
-                fee_percent: 0.30,
-            },
-            SwapPath {
-                rank: 2,
-                hops: vec!["0xPoolHop1".into(), "0xPoolHop2".into()],
-                hop_tokens: vec![
-                    req.sell_token.clone(),
-                    "0xWETH_PLACEHOLDER".into(),
-                    req.target_token.clone(),
-                ],
-                estimated_output: req.amount.clone(),
-                estimated_price_impact: 0.25,
-                fee_percent: 0.60,
-            },
-            SwapPath {
-                rank: 3,
-                hops: vec!["0xPoolAltA".into(), "0xPoolAltB".into()],
-                hop_tokens: vec![
-                    req.sell_token.clone(),
-                    "0xUSDC_PLACEHOLDER".into(),
-                    req.target_token.clone(),
-                ],
-                estimated_output: req.amount.clone(),
-                estimated_price_impact: 0.35,
-                fee_percent: 0.55,
-            },
-        ];
+        let rpc_url: alloy::transports::http::reqwest::Url = self
+            .rpc_url
+            .parse()
+            .map_err(|_| Status::internal("Invalid RPC URL"))?;
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+        let sell_pools = pools::discover_pools(provider.clone(), &req.chain, &sell_token)
+            .await
+            .map_err(|e| Status::internal(format!("Pool discovery failed: {e}")))?;
+
+        let target_pools = if sell_token.eq_ignore_ascii_case(&target_token) {
+            Vec::new()
+        } else {
+            pools::discover_pools(provider, &req.chain, &target_token)
+                .await
+                .map_err(|e| Status::internal(format!("Pool discovery failed: {e}")))?
+        };
+
+        let mut paths: Vec<SwapPath> = sell_pools
+            .iter()
+            .filter_map(|pool| {
+                build_swap_path(
+                    &pool.pool_address,
+                    &pool.token0,
+                    &pool.token1,
+                    pool.fee_tier,
+                    &sell_token,
+                    &target_token,
+                    &target_pools,
+                    Some(req.amount.as_str()),
+                )
+            })
+            .collect();
+
+        paths = dedupe_paths(paths);
+        paths.sort_by(compare_path_score);
+        paths.truncate(5);
+
+        for (idx, path) in paths.iter_mut().enumerate() {
+            path.rank = (idx + 1) as u32;
+        }
 
         Ok(Response::new(GetSwapPathsResponse { paths }))
     }
@@ -324,84 +334,43 @@ impl SessionService for SessionServiceImpl {
         request: Request<ComputePoolPathRequest>,
     ) -> Result<Response<ComputePoolPathResponse>, Status> {
         let req = request.into_inner();
+        let sell_token = normalize_token_for_chain(&req.chain, &req.sell_token);
+        let target_token = normalize_token_for_chain(&req.chain, &req.target_token);
+        let token0 = normalize_token_for_chain(&req.chain, &req.token0);
+        let token1 = normalize_token_for_chain(&req.chain, &req.token1);
 
-        let sell = req.sell_token.to_lowercase();
-        let target = req.target_token.to_lowercase();
-        let t0 = req.token0.to_lowercase();
-        let t1 = req.token1.to_lowercase();
-
-        // Determine the "other" token in the pool (the one that isn't the sell token)
-        let other_token = if t0 == sell {
-            &req.token1
-        } else if t1 == sell {
-            &req.token0
-        } else {
+        if other_token_in_pool(&sell_token, &token0, &token1).is_none() {
             return Err(Status::invalid_argument(
                 "Sell token not found in pool's token pair",
             ));
-        };
-
-        // Case 1: Direct pair — pool contains both sell and target tokens
-        if t0 == target || t1 == target {
-            let path = SwapPath {
-                rank: 1,
-                hops: vec![req.pool_address.clone()],
-                hop_tokens: vec![req.sell_token.clone(), req.target_token.clone()],
-                estimated_output: String::new(),
-                estimated_price_impact: 0.0,
-                fee_percent: if req.fee_tier > 0 {
-                    req.fee_tier as f64 / 10000.0
-                } else {
-                    0.3
-                },
-            };
-            return Ok(Response::new(ComputePoolPathResponse { path: Some(path) }));
         }
 
-        // Case 2: The pool's other token is a base token — try to find a second pool
-        // from other_token → target_token
         let rpc_url: alloy::transports::http::reqwest::Url = self
             .rpc_url
             .parse()
             .map_err(|_| Status::internal("Invalid RPC URL"))?;
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
-        let second_pools = pools::discover_pools(provider, &req.chain, &req.target_token)
+        let second_pools = pools::discover_pools(provider, &req.chain, &target_token)
             .await
             .map_err(|e| Status::internal(format!("Pool discovery failed: {e}")))?;
 
-        // Find a pool that pairs other_token with target_token
-        let other_lower = other_token.to_lowercase();
-        if let Some(bridge) = second_pools.iter().find(|p| {
-            let pt0 = p.token0.to_lowercase();
-            let pt1 = p.token1.to_lowercase();
-            (pt0 == other_lower && pt1 == target) || (pt1 == other_lower && pt0 == target)
-        }) {
-            let path = SwapPath {
-                rank: 1,
-                hops: vec![req.pool_address.clone(), bridge.pool_address.clone()],
-                hop_tokens: vec![
-                    req.sell_token.clone(),
-                    other_token.to_string(),
-                    req.target_token.clone(),
-                ],
-                estimated_output: String::new(),
-                estimated_price_impact: 0.0,
-                fee_percent: if req.fee_tier > 0 {
-                    req.fee_tier as f64 / 10000.0
-                } else {
-                    0.3
-                } + if bridge.fee_tier > 0 {
-                    bridge.fee_tier as f64 / 10000.0
-                } else {
-                    0.3
-                },
-            };
-            return Ok(Response::new(ComputePoolPathResponse { path: Some(path) }));
-        }
+        let path = build_swap_path(
+            &req.pool_address,
+            &token0,
+            &token1,
+            req.fee_tier,
+            &sell_token,
+            &target_token,
+            &second_pools,
+            None,
+        )
+        .map(|mut path| {
+            path.rank = 1;
+            path
+        });
 
-        // No route found
-        Ok(Response::new(ComputePoolPathResponse { path: None }))
+        Ok(Response::new(ComputePoolPathResponse { path }))
     }
 
     async fn get_active_sessions_for_token(
@@ -468,6 +437,7 @@ impl SessionService for SessionServiceImpl {
         request: Request<DiscoverPoolsRequest>,
     ) -> Result<Response<DiscoverPoolsResponse>, Status> {
         let req = request.into_inner();
+        let token_address = normalize_token_for_chain(&req.chain, &req.token_address);
 
         let rpc_url: alloy::transports::http::reqwest::Url = self
             .rpc_url
@@ -475,27 +445,30 @@ impl SessionService for SessionServiceImpl {
             .map_err(|_| Status::internal("Invalid RPC URL configured"))?;
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
-        let discovered = pools::discover_pools(provider, &req.chain, &req.token_address)
+        let discovered = pools::discover_pools(provider, &req.chain, &token_address)
             .await
             .map_err(|e| Status::internal(format!("Pool discovery failed: {e}")))?;
 
         let pools = discovered
             .into_iter()
-            .map(|p| PoolInfo {
-                pool_address: p.pool_address,
-                pool_type: p.pool_type.to_string(),
-                dex_name: p.dex_name,
-                token0: p.token0,
-                token1: p.token1,
-                fee_tier: p.fee_tier,
-                reserve0: p.reserve0,
-                reserve1: p.reserve1,
-                liquidity: p.liquidity,
-                balance0: p.balance0,
-                balance1: p.balance1,
-                token0_price_usd: p.token0_price_usd,
-                token1_price_usd: p.token1_price_usd,
-                swap_path_json: String::new(),
+            .map(|pool| {
+                let swap_path_json = build_default_pool_swap_path_json(&pool, &token_address);
+                PoolInfo {
+                    pool_address: pool.pool_address,
+                    pool_type: pool.pool_type.to_string(),
+                    dex_name: pool.dex_name,
+                    token0: pool.token0,
+                    token1: pool.token1,
+                    fee_tier: pool.fee_tier,
+                    reserve0: pool.reserve0.unwrap_or_default(),
+                    reserve1: pool.reserve1.unwrap_or_default(),
+                    liquidity: pool.liquidity.unwrap_or_default(),
+                    balance0: pool.balance0.unwrap_or_default(),
+                    balance1: pool.balance1.unwrap_or_default(),
+                    token0_price_usd: pool.token0_price_usd,
+                    token1_price_usd: pool.token1_price_usd,
+                    swap_path_json,
+                }
             })
             .collect();
 
@@ -650,6 +623,147 @@ fn parse_pool_swap_path_json(path: &str, pool_address: &str) -> Result<serde_jso
     Ok(value)
 }
 
+fn fee_percent_from_tier(fee_tier: u32) -> f64 {
+    if fee_tier > 0 {
+        fee_tier as f64 / 10_000.0
+    } else {
+        0.3
+    }
+}
+
+fn estimate_output(amount_hint: Option<&str>, fee_percent: f64) -> String {
+    let Some(raw_amount) = amount_hint.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "0".to_string();
+    };
+
+    match raw_amount.parse::<f64>() {
+        Ok(amount) if amount.is_finite() && amount > 0.0 => {
+            let adjusted = (amount * (1.0 - (fee_percent / 100.0))).max(0.0);
+            format!("{adjusted:.0}")
+        }
+        _ => raw_amount.to_string(),
+    }
+}
+
+fn estimate_price_impact(hop_count: usize, fee_percent: f64) -> f64 {
+    let hop_penalty = (hop_count.max(1) as f64) * 0.1;
+    let fee_penalty = fee_percent * 0.5;
+    hop_penalty + fee_penalty
+}
+
+fn other_token_in_pool<'a>(sell_token: &str, token0: &'a str, token1: &'a str) -> Option<&'a str> {
+    if token0.eq_ignore_ascii_case(sell_token) {
+        Some(token1)
+    } else if token1.eq_ignore_ascii_case(sell_token) {
+        Some(token0)
+    } else {
+        None
+    }
+}
+
+fn build_swap_path(
+    pool_address: &str,
+    token0: &str,
+    token1: &str,
+    fee_tier: u32,
+    sell_token: &str,
+    target_token: &str,
+    target_pools: &[pools::DiscoveredPool],
+    amount_hint: Option<&str>,
+) -> Option<SwapPath> {
+    let other_token = other_token_in_pool(sell_token, token0, token1)?;
+    let direct_fee_percent = fee_percent_from_tier(fee_tier);
+
+    if token0.eq_ignore_ascii_case(target_token) || token1.eq_ignore_ascii_case(target_token) {
+        return Some(SwapPath {
+            rank: 0,
+            hops: vec![pool_address.to_string()],
+            hop_tokens: vec![sell_token.to_string(), target_token.to_string()],
+            estimated_output: estimate_output(amount_hint, direct_fee_percent),
+            estimated_price_impact: estimate_price_impact(1, direct_fee_percent),
+            fee_percent: direct_fee_percent,
+        });
+    }
+
+    let other_lower = other_token.to_lowercase();
+    let target_lower = target_token.to_lowercase();
+
+    let bridge_pool = target_pools
+        .iter()
+        .filter(|pool| {
+            let token0 = pool.token0.to_lowercase();
+            let token1 = pool.token1.to_lowercase();
+            (token0 == other_lower && token1 == target_lower)
+                || (token1 == other_lower && token0 == target_lower)
+        })
+        .min_by(|a, b| {
+            fee_percent_from_tier(a.fee_tier)
+                .partial_cmp(&fee_percent_from_tier(b.fee_tier))
+                .unwrap_or(Ordering::Equal)
+        })?;
+
+    let total_fee_percent = direct_fee_percent + fee_percent_from_tier(bridge_pool.fee_tier);
+
+    Some(SwapPath {
+        rank: 0,
+        hops: vec![pool_address.to_string(), bridge_pool.pool_address.clone()],
+        hop_tokens: vec![
+            sell_token.to_string(),
+            other_token.to_string(),
+            target_token.to_string(),
+        ],
+        estimated_output: estimate_output(amount_hint, total_fee_percent),
+        estimated_price_impact: estimate_price_impact(2, total_fee_percent),
+        fee_percent: total_fee_percent,
+    })
+}
+
+fn compare_path_score(a: &SwapPath, b: &SwapPath) -> Ordering {
+    (a.estimated_price_impact + a.fee_percent)
+        .partial_cmp(&(b.estimated_price_impact + b.fee_percent))
+        .unwrap_or(Ordering::Equal)
+}
+
+fn dedupe_paths(paths: Vec<SwapPath>) -> Vec<SwapPath> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+
+    for path in paths {
+        let key = format!("{}|{}", path.hops.join(","), path.hop_tokens.join(","));
+        if seen.insert(key) {
+            unique.push(path);
+        }
+    }
+
+    unique
+}
+
+fn build_default_pool_swap_path_json(pool: &pools::DiscoveredPool, token_address: &str) -> String {
+    let token0_matches = pool.token0.eq_ignore_ascii_case(token_address);
+    let token1_matches = pool.token1.eq_ignore_ascii_case(token_address);
+
+    let (from_token, to_token) = if token0_matches {
+        (pool.token0.clone(), pool.token1.clone())
+    } else if token1_matches {
+        (pool.token1.clone(), pool.token0.clone())
+    } else {
+        (pool.token0.clone(), pool.token1.clone())
+    };
+
+    let fee_tiers = if matches!(pool.pool_type, PoolType::V3) {
+        vec![pool.fee_tier]
+    } else {
+        Vec::new()
+    };
+
+    serde_json::json!({
+        "hops": [pool.pool_address.clone()],
+        "hop_tokens": [from_token, to_token],
+        "fee_tiers": fee_tiers,
+    })
+    .to_string()
+}
+
 async fn fetch_session(db: &PgPool, session_id: Uuid) -> Result<Option<SessionInfo>, sqlx::Error> {
     let row = sqlx::query(
         r#"
@@ -713,9 +827,9 @@ fn row_to_session_info(row: &sqlx::postgres::PgRow) -> SessionInfo {
 async fn fetch_session_pools(db: &PgPool, session_id: Uuid) -> Result<Vec<PoolInfo>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        SELECT pool_address, pool_type::text, dex_name, token0, token1, fee_tier, swap_path
-        FROM session_pools
-        WHERE session_id = $1
+        SELECT sp.pool_address, sp.pool_type::text, sp.dex_name, sp.token0, sp.token1, sp.fee_tier, sp.swap_path
+        FROM session_pools sp
+        WHERE sp.session_id = $1
         ORDER BY dex_name, pool_type::text, fee_tier
         "#,
     )

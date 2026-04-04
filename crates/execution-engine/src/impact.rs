@@ -185,4 +185,46 @@ mod tests {
         );
         assert_eq!(impact, 5000);
     }
+
+    #[test]
+    fn test_zero_reserve_x() {
+        let impact = calculate_impact_from_reserves(
+            U256::ZERO,
+            U256::from(500_000u64),
+            U256::from(1_000u64),
+        );
+        assert_eq!(impact, 0);
+    }
+
+    #[test]
+    fn test_zero_reserve_y() {
+        let impact = calculate_impact_from_reserves(
+            U256::from(1_000_000u64),
+            U256::ZERO,
+            U256::from(1_000u64),
+        );
+        assert_eq!(impact, 0);
+    }
+
+    #[test]
+    fn test_very_large_trade() {
+        // Selling 100x the reserve → ~9901 bps (99.01%)
+        let impact = calculate_impact_from_reserves(
+            U256::from(1_000u64),
+            U256::from(1_000u64),
+            U256::from(100_000u64),
+        );
+        assert!(impact > 9800, "Expected >9800 bps, got {impact}");
+    }
+
+    #[test]
+    fn test_tiny_trade() {
+        // 1 wei into a huge pool
+        let impact = calculate_impact_from_reserves(
+            U256::from(10u64).pow(U256::from(18)),
+            U256::from(10u64).pow(U256::from(18)),
+            U256::from(1u64),
+        );
+        assert_eq!(impact, 0);
+    }
 }

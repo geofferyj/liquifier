@@ -434,4 +434,50 @@ mod tests {
         let result = cache.swap_usd_values("ethereum", "0xA", 100.0, "0xB", 200.0);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_price_cache_new_empty() {
+        let cache = PriceCache::new();
+        assert!(cache.get_base_token_price("any", "0x0").is_none());
+    }
+
+    #[test]
+    fn test_set_price_overwrites() {
+        let cache = PriceCache::new();
+        cache.set_price("eth", "0xA", 100.0);
+        cache.set_price("eth", "0xA", 200.0);
+        assert_eq!(cache.get_base_token_price("eth", "0xA"), Some(200.0));
+    }
+
+    #[test]
+    fn test_price_different_chains() {
+        let cache = PriceCache::new();
+        cache.set_price("eth", "0xA", 100.0);
+        cache.set_price("bsc", "0xA", 99.0);
+        assert_eq!(cache.get_base_token_price("eth", "0xA"), Some(100.0));
+        assert_eq!(cache.get_base_token_price("bsc", "0xA"), Some(99.0));
+    }
+
+    #[test]
+    fn test_token_amount_usd_zero_amount() {
+        let cache = PriceCache::new();
+        cache.set_price("eth", "0xA", 100.0);
+        let usd = cache.token_amount_usd("eth", "0xA", 0.0, "0xB", 0.0);
+        assert_eq!(usd, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn test_mock_price_fetcher() {
+        let fetcher = MockPriceFetcher::new(vec![("0xWETH", 2000.0), ("0xUSDC", 1.0)]);
+        let tokens = vec![
+            ("0xWETH".to_string(), "0xOracle1".to_string()),
+            ("0xUSDC".to_string(), "0xOracle2".to_string()),
+            ("0xUnknown".to_string(), "0xOracle3".to_string()),
+        ];
+        let prices = fetcher.fetch_usd_prices("eth", "http://rpc", &tokens).await.unwrap();
+        assert_eq!(prices.len(), 2);
+        assert_eq!(prices.get("0xweth"), Some(&2000.0));
+        assert_eq!(prices.get("0xusdc"), Some(&1.0));
+        assert!(prices.get("0xunknown").is_none());
+    }
 }

@@ -285,27 +285,33 @@ impl WalletKms for KmsService {
         let signer = PrivateKeySigner::from_slice(&private_key_bytes)
             .map_err(|e| Status::internal(format!("Key reconstruction error: {e}")))?;
 
-        // Sign the raw transaction bytes (hash first — unsigned_tx is RLP-encoded, not a hash)
-        use alloy::signers::Signer;
-        let tx_hash = alloy::primitives::keccak256(&req.unsigned_tx);
-        let signature = signer
-            .sign_hash(&tx_hash)
+        use alloy::network::{EthereumWallet, TransactionBuilder};
+        use alloy::rpc::types::TransactionRequest;
+
+        // Deserialize the unsigned transaction envelope from JSON
+        let tx_request: TransactionRequest =
+            serde_json::from_slice(&req.unsigned_tx).map_err(|e| {
+                Status::invalid_argument(format!("Failed to deserialize TransactionRequest: {e}"))
+            })?;
+
+        // Build a typed transaction and sign it
+        let wallet = EthereumWallet::from(signer);
+        let signed_tx = tx_request
+            .build(&wallet)
             .await
-            .map_err(|e| Status::internal(format!("Signing error: {e}")))?;
+            .map_err(|e| Status::internal(format!("Transaction signing error: {e}")))?;
 
-        let sig_bytes = {
-            let mut buf = Vec::with_capacity(65);
-            buf.extend_from_slice(&signature.r().to_be_bytes::<32>());
-            buf.extend_from_slice(&signature.s().to_be_bytes::<32>());
-            buf.push(signature.v() as u8);
-            buf
-        };
+        // Encode the signed transaction as RLP bytes for submission
+        let tx_hash = format!("{:?}", signed_tx.tx_hash());
+        let mut encoded = Vec::new();
+        use alloy::eips::eip2718::Encodable2718;
+        signed_tx.encode_2718(&mut encoded);
 
-        info!(wallet_id = %wallet_id, "Transaction signed");
+        info!(wallet_id = %wallet_id, tx_hash = %tx_hash, "Transaction signed");
 
         Ok(Response::new(SignTransactionResponse {
-            signed_tx: sig_bytes,
-            tx_hash: String::new(), // caller computes final tx hash after assembly
+            signed_tx: encoded,
+            tx_hash,
         }))
     }
 
@@ -362,6 +368,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = liquifier_config::Settings::global();
+    cfg.validate_or_warn();
 
     let database_url = &cfg.database.url;
     let master_key_hex = &cfg.kms.master_encryption_key;
