@@ -230,19 +230,6 @@ export default function SessionDashboardPage() {
       ? liveData?.recentTrades ?? []
       : sessionTradesQuery.data?.trades ?? [];
 
-  const confirmedTrades = recentTrades.filter((t) => t.status === "confirmed");
-
-  // Prefer backend aggregate (covers full session, not just the paginated trade list).
-  const totalReceivedRaw =
-    sessionTradesQuery.data?.total_received ??
-    confirmedTrades.reduce((acc, t) => {
-      try {
-        return acc + BigInt(t.received_amount ?? "0");
-      } catch {
-        return acc;
-      }
-    }, 0n).toString();
-
   const walletTargetBalance = targetBalanceQuery.data?.balance ?? "0";
 
   const sellTokenUsdPrice = sellTokenUsdPriceQuery.data?.usd_price;
@@ -262,11 +249,6 @@ export default function SessionDashboardPage() {
     remaining,
     session.sell_token_decimals,
     sellTokenUsdPrice,
-  );
-  const totalReceivedUsd = calculateUsdValue(
-    totalReceivedRaw,
-    session.target_token_decimals,
-    targetTokenUsdPrice,
   );
   const walletBalanceUsd = calculateUsdValue(
     walletTargetBalance,
@@ -387,7 +369,7 @@ export default function SessionDashboardPage() {
       </div>
 
       {/* Metric Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
@@ -445,26 +427,6 @@ export default function SessionDashboardPage() {
               {session.sell_token_symbol}
             </p>
             <p className="text-xs text-muted-foreground">{formatUsd(remainingUsd)}</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-muted-foreground">
-              Total Received
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p
-              className="text-xl md:text-2xl font-bold font-mono text-green-500 leading-tight break-all"
-              title={formatTokenAmount(totalReceivedRaw, session.target_token_decimals)}
-            >
-              {formatTokenAmountCompact(totalReceivedRaw, session.target_token_decimals)}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {session.target_token_symbol}
-            </p>
-            <p className="text-xs text-muted-foreground">{formatUsd(totalReceivedUsd)}</p>
           </CardContent>
         </Card>
 
