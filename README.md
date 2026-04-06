@@ -124,6 +124,12 @@ See [`.env.example`](.env.example) for the full list. Key variables:
 | `MASTER_ENCRYPTION_KEY` | 32-byte hex key for AES-256-GCM wallet encryption |
 | `EVM_WS_URLS` | Comma-separated EVM WebSocket RPC endpoints |
 | `EVM_RPC_URLS` | Comma-separated EVM HTTP RPC endpoints |
+| `APP__APPLICATION__ENVIRONMENT` | Active config profile (`production` loads `config/production.yml`) |
+| `APP__SMTP__BASE_URL` | Public base URL for verification links in emails |
+| `APP__API_GATEWAY__CORS_ALLOWED_ORIGIN` | Trusted browser origin for API CORS |
+| `APP__WEBSOCKET__CORS_ALLOWED_ORIGIN` | Trusted browser origin for WebSocket CORS |
+| `NEXT_PUBLIC_API_URL` | Frontend API base URL (for Caddy setup use `https://liquifier.penitools.com`) |
+| `NEXT_PUBLIC_WS_URL` | Frontend WS base URL (for Caddy setup use `wss://liquifier.penitools.com`) |
 
 ## License
 

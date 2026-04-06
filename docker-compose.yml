@@ -84,6 +84,9 @@ services:
     ports:
       - "8082:8080"
     environment:
+      APP__APPLICATION__ENVIRONMENT: ${APP__APPLICATION__ENVIRONMENT:-production}
+      APP__SMTP__BASE_URL: ${APP__SMTP__BASE_URL:-https://liquifier.penitools.com}
+      APP__API_GATEWAY__CORS_ALLOWED_ORIGIN: ${APP__API_GATEWAY__CORS_ALLOWED_ORIGIN:-https://liquifier.penitools.com}
       RUST_LOG: info,api_gateway=debug
 
   # ──────────────────────────────────────────────────────────────
@@ -165,6 +168,8 @@ services:
     ports:
       - "8083:8081"
     environment:
+      APP__APPLICATION__ENVIRONMENT: ${APP__APPLICATION__ENVIRONMENT:-production}
+      APP__WEBSOCKET__CORS_ALLOWED_ORIGIN: ${APP__WEBSOCKET__CORS_ALLOWED_ORIGIN:-https://liquifier.penitools.com}
       RUST_LOG: info,websocket_service=debug
 
   # ──────────────────────────────────────────────────────────────
@@ -175,13 +180,13 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8082
-        NEXT_PUBLIC_WS_URL: ws://localhost:8083
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://liquifier.penitools.com}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-wss://liquifier.penitools.com}
     ports:
       - "3001:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8082
-      NEXT_PUBLIC_WS_URL: ws://localhost:8083
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://liquifier.penitools.com}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-wss://liquifier.penitools.com}
     depends_on:
       - api-gateway
       - websocket-service

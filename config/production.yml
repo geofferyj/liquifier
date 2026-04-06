@@ -5,8 +5,11 @@ application:
 database:
   max_connections: 25
 
+smtp:
+  base_url: "https://liquifier.penitools.com"
+
 api_gateway:
-  cors_allowed_origin: "https://app.example.com"
+  cors_allowed_origin: "https://liquifier.penitools.com"
 
 websocket:
-  cors_allowed_origin: "https://app.example.com"
+  cors_allowed_origin: "https://liquifier.penitools.com"
