@@ -126,6 +126,11 @@ export interface Trade {
   executed_at: string;
 }
 
+export interface SessionTradesResponse {
+  trades: Trade[];
+  total_received: string;
+}
+
 // WebSocket message types
 export type WsMessageType = "session_update" | "trade_completed";
 
@@ -167,6 +172,13 @@ export interface TotpSetupResponse {
   secret: string;
   otpauth_url: string;
   qr_code_base64: string;
+}
+
+export interface TokenUsdPrice {
+  token_address: string;
+  usd_price: number;
+  pool_address: string;
+  pool_version: number;
 }
 
 export interface RefundRequest {

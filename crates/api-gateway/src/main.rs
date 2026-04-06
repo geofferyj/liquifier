@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
             post(routes::compute_pool_path),
         )
         .route("/api/v1/tokens/metadata", get(routes::get_token_metadata))
+        .route("/api/v1/tokens/usd-price", get(routes::get_token_usd_price))
         // Refund requests (common users create, all users list their own)
         .route("/api/v1/refunds", post(routes::create_refund_request))
         .route("/api/v1/refunds", get(routes::list_my_refund_requests))
@@ -340,6 +341,31 @@ async fn run_deposit_alert_consumer(
             }
         };
 
+        // Skip alerts for transfer events where the sender is a tracked pool.
+        // These are usually session-driven sells and should not be treated as user deposits.
+        match is_tracked_pool_transfer(db, &deposit.chain, &deposit.from).await {
+            Ok(true) => {
+                info!(
+                    chain = %deposit.chain,
+                    from = %deposit.from,
+                    to = %deposit.to,
+                    tx = %deposit.tx_hash,
+                    "Skipping deposit alert: transfer originated from tracked pool"
+                );
+                let _ = msg.ack().await;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    chain = %deposit.chain,
+                    from = %deposit.from,
+                    error = %e,
+                    "Failed to check tracked pool transfer; continuing with alert processing"
+                );
+            }
+        }
+
         // Look up user info
         let user_info = sqlx::query(
             "SELECT email, COALESCE(username, email) as display_name FROM users WHERE id = $1::uuid",
@@ -416,6 +442,30 @@ async fn run_deposit_alert_consumer(
     }
 
     Ok(())
+}
+
+async fn is_tracked_pool_transfer(
+    db: &sqlx::PgPool,
+    chain: &str,
+    from_address: &str,
+) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM session_pools sp
+            JOIN sessions s ON s.id = sp.session_id
+            WHERE LOWER(sp.pool_address) = LOWER($1)
+              AND s.chain::text = $2
+              AND s.status = 'active'
+        )",
+    )
+    .bind(from_address)
+    .bind(chain)
+    .fetch_one(db)
+    .await
+    .context("Failed querying tracked pool address")?;
+
+    Ok(exists)
 }
 
 // ─────────────────────────────────────────────────────────────

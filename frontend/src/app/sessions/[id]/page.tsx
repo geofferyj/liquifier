@@ -29,6 +29,61 @@ import {
 } from "@/lib/utils";
 import type { Session, SessionStatus } from "@/lib/types";
 
+function formatTokenAmountCompact(raw: string, decimals: number): string {
+  if (!raw || raw === "0") return "0";
+
+  try {
+    const amountRaw = BigInt(raw);
+    const divisor = 10n ** BigInt(decimals);
+    const units = [
+      { threshold: 1_000_000_000_000n, suffix: "T" },
+      { threshold: 1_000_000_000n, suffix: "B" },
+      { threshold: 1_000_000n, suffix: "M" },
+      { threshold: 1_000n, suffix: "K" },
+    ];
+
+    for (const unit of units) {
+      const unitDivisor = divisor * unit.threshold;
+      if (amountRaw >= unitDivisor) {
+        const scaledX100 = (amountRaw * 100n) / unitDivisor;
+        const intPart = scaledX100 / 100n;
+        const fracPart = scaledX100 % 100n;
+        return `${intPart.toString()}.${fracPart.toString().padStart(2, "0")}${unit.suffix}`;
+      }
+    }
+  } catch {
+    // Fallback to full formatting below.
+  }
+
+  return formatTokenAmount(raw, decimals);
+}
+
+function rawTokenAmountToNumber(raw: string, decimals: number): number {
+  const parsed = Number.parseFloat(formatTokenAmount(raw, decimals));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function calculateUsdValue(
+  rawAmount: string,
+  decimals: number,
+  usdPrice?: number,
+): number | null {
+  if (usdPrice === undefined || !Number.isFinite(usdPrice)) {
+    return null;
+  }
+  return rawTokenAmountToNumber(rawAmount, decimals) * usdPrice;
+}
+
+function formatUsd(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "USD —";
+  }
+  return `$${value.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
 export default function SessionDashboardPage() {
   const router = useRouter();
   const role = useAuthStore((s) => s.role);
@@ -60,10 +115,7 @@ export default function SessionDashboardPage() {
   // Fetch recent trades for first-load hydration.
   const sessionTradesQuery = useQuery({
     queryKey: ["session-trades", sessionId],
-    queryFn: async () => {
-      const resp = await api.getSessionTrades(sessionId, 50);
-      return resp.trades;
-    },
+    queryFn: () => api.getSessionTrades(sessionId, 50),
     enabled: !!sessionId,
     refetchInterval: 15_000,
   });
@@ -101,6 +153,22 @@ export default function SessionDashboardPage() {
 
   const session = sessionQuery.data;
 
+  const sellTokenUsdPriceQuery = useQuery({
+    queryKey: ["token-usd-price", session?.chain, session?.sell_token],
+    queryFn: () => api.getTokenUsdPrice(session!.chain, session!.sell_token),
+    enabled: !!session?.chain && !!session?.sell_token,
+    staleTime: 5 * 60_000,
+    refetchInterval: 60_000,
+  });
+
+  const targetTokenUsdPriceQuery = useQuery({
+    queryKey: ["token-usd-price", session?.chain, session?.target_token],
+    queryFn: () => api.getTokenUsdPrice(session!.chain, session!.target_token),
+    enabled: !!session?.chain && !!session?.target_token,
+    staleTime: 5 * 60_000,
+    refetchInterval: 60_000,
+  });
+
   // Fetch the wallet's current target-token balance.
   const targetBalanceQuery = useQuery({
     queryKey: ["wallet-target-balance", session?.wallet_id, session?.target_token],
@@ -123,7 +191,7 @@ export default function SessionDashboardPage() {
       remaining: (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString(),
       convertedValueUsd: liveData?.convertedValueUsd ?? "0.00",
       status: session.status,
-      recentTrades: sessionTradesQuery.data,
+      recentTrades: sessionTradesQuery.data.trades,
     });
   }, [
     liveData?.convertedValueUsd,
@@ -160,18 +228,51 @@ export default function SessionDashboardPage() {
   const recentTrades =
     (liveData?.recentTrades.length ?? 0) > 0
       ? liveData?.recentTrades ?? []
-      : sessionTradesQuery.data ?? [];
+      : sessionTradesQuery.data?.trades ?? [];
 
-  // Sum all received_amount values from trades to get total target-token received.
-  const totalReceived = recentTrades.reduce((acc, t) => {
-    try {
-      return acc + BigInt(t.received_amount ?? "0");
-    } catch {
-      return acc;
-    }
-  }, 0n);
+  const confirmedTrades = recentTrades.filter((t) => t.status === "confirmed");
+
+  // Prefer backend aggregate (covers full session, not just the paginated trade list).
+  const totalReceivedRaw =
+    sessionTradesQuery.data?.total_received ??
+    confirmedTrades.reduce((acc, t) => {
+      try {
+        return acc + BigInt(t.received_amount ?? "0");
+      } catch {
+        return acc;
+      }
+    }, 0n).toString();
 
   const walletTargetBalance = targetBalanceQuery.data?.balance ?? "0";
+
+  const sellTokenUsdPrice = sellTokenUsdPriceQuery.data?.usd_price;
+  const targetTokenUsdPrice = targetTokenUsdPriceQuery.data?.usd_price;
+
+  const totalToSellUsd = calculateUsdValue(
+    session.total_amount,
+    session.sell_token_decimals,
+    sellTokenUsdPrice,
+  );
+  const amountSoldUsd = calculateUsdValue(
+    amountSold,
+    session.sell_token_decimals,
+    sellTokenUsdPrice,
+  );
+  const remainingUsd = calculateUsdValue(
+    remaining,
+    session.sell_token_decimals,
+    sellTokenUsdPrice,
+  );
+  const totalReceivedUsd = calculateUsdValue(
+    totalReceivedRaw,
+    session.target_token_decimals,
+    targetTokenUsdPrice,
+  );
+  const walletBalanceUsd = calculateUsdValue(
+    walletTargetBalance,
+    session.target_token_decimals,
+    targetTokenUsdPrice,
+  );
 
   // Build chart data from recent trades
   const chartData = recentTrades
@@ -179,8 +280,8 @@ export default function SessionDashboardPage() {
     .reverse()
     .map((t, i) => ({
       index: i + 1,
-      amount: parseFloat(t.sell_amount) / Math.pow(10, session.sell_token_decimals),
-      impact: t.price_impact_bps / 100,
+      amount: rawTokenAmountToNumber(t.sell_amount, session.sell_token_decimals),
+      impact_bps: t.price_impact_bps,
       time: new Date(t.executed_at).toLocaleTimeString(),
     }));
 
@@ -294,12 +395,16 @@ export default function SessionDashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono">
-              {formatTokenAmount(session.total_amount, session.sell_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono leading-tight break-all"
+              title={formatTokenAmount(session.total_amount, session.sell_token_decimals)}
+            >
+              {formatTokenAmountCompact(session.total_amount, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.sell_token_symbol}
             </p>
+            <p className="text-xs text-muted-foreground">{formatUsd(totalToSellUsd)}</p>
           </CardContent>
         </Card>
 
@@ -310,12 +415,16 @@ export default function SessionDashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono text-primary">
-              {formatTokenAmount(amountSold, session.sell_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono text-primary leading-tight break-all"
+              title={formatTokenAmount(amountSold, session.sell_token_decimals)}
+            >
+              {formatTokenAmountCompact(amountSold, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.sell_token_symbol}
             </p>
+            <p className="text-xs text-muted-foreground">{formatUsd(amountSoldUsd)}</p>
           </CardContent>
         </Card>
 
@@ -326,12 +435,16 @@ export default function SessionDashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono">
-              {formatTokenAmount(remaining, session.sell_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono leading-tight break-all"
+              title={formatTokenAmount(remaining, session.sell_token_decimals)}
+            >
+              {formatTokenAmountCompact(remaining, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.sell_token_symbol}
             </p>
+            <p className="text-xs text-muted-foreground">{formatUsd(remainingUsd)}</p>
           </CardContent>
         </Card>
 
@@ -342,12 +455,16 @@ export default function SessionDashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono text-green-500">
-              {formatTokenAmount(totalReceived.toString(), session.target_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono text-green-500 leading-tight break-all"
+              title={formatTokenAmount(totalReceivedRaw, session.target_token_decimals)}
+            >
+              {formatTokenAmountCompact(totalReceivedRaw, session.target_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.target_token_symbol}
             </p>
+            <p className="text-xs text-muted-foreground">{formatUsd(totalReceivedUsd)}</p>
           </CardContent>
         </Card>
 
@@ -358,12 +475,16 @@ export default function SessionDashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono text-primary">
-              {formatTokenAmount(walletTargetBalance, session.target_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono text-primary leading-tight break-all"
+              title={formatTokenAmount(walletTargetBalance, session.target_token_decimals)}
+            >
+              {formatTokenAmountCompact(walletTargetBalance, session.target_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.target_token_symbol}
             </p>
+            <p className="text-xs text-muted-foreground">{formatUsd(walletBalanceUsd)}</p>
           </CardContent>
         </Card>
       </div>
@@ -431,10 +552,10 @@ export default function SessionDashboardPage() {
                     }}
                   />
                   <Bar
-                    dataKey="impact"
+                    dataKey="impact_bps"
                     fill="hsl(var(--accent))"
                     radius={[4, 4, 0, 0]}
-                    name="Impact %"
+                    name="Impact (bps)"
                   />
                 </BarChart>
               </ResponsiveContainer>

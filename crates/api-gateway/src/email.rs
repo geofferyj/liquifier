@@ -12,6 +12,55 @@ pub struct EmailSender {
     base_url: String,
 }
 
+fn format_wei_as_ether(amount_wei: &str) -> String {
+    let trimmed = amount_wei.trim();
+    if trimmed.is_empty() {
+        return "0".to_string();
+    }
+
+    let (is_negative, digits) = if let Some(stripped) = trimmed.strip_prefix('-') {
+        (true, stripped)
+    } else {
+        (false, trimmed)
+    };
+
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return amount_wei.to_string();
+    }
+
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return "0".to_string();
+    }
+
+    const DECIMALS: usize = 18;
+    let mut formatted = if digits.len() <= DECIMALS {
+        let mut fractional = "0".repeat(DECIMALS - digits.len());
+        fractional.push_str(digits);
+        let fractional = fractional.trim_end_matches('0');
+        if fractional.is_empty() {
+            "0".to_string()
+        } else {
+            format!("0.{fractional}")
+        }
+    } else {
+        let split = digits.len() - DECIMALS;
+        let integer = &digits[..split];
+        let fractional = digits[split..].trim_end_matches('0');
+        if fractional.is_empty() {
+            integer.to_string()
+        } else {
+            format!("{integer}.{fractional}")
+        }
+    };
+
+    if is_negative {
+        formatted.insert(0, '-');
+    }
+
+    formatted
+}
+
 impl EmailSender {
     pub fn new(cfg: &liquifier_config::SmtpSettings) -> Option<Self> {
         if cfg.host.is_empty() {
@@ -120,17 +169,19 @@ impl EmailSender {
         username: &str,
         user_email: &str,
         wallet_address: &str,
-        amount: &str,
+        amount_wei: &str,
         token: &str,
         tx_hash: &str,
         chain: &str,
     ) {
+        let amount_display = format_wei_as_ether(amount_wei);
+
         let body = format!(
             "New Deposit Alert\n\n\
              A common user has received a deposit:\n\n\
              User: {username} ({user_email})\n\
              Wallet: {wallet_address}\n\
-             Amount: {amount}\n\
+             Amount: {amount_display}\n\
              Token: {token}\n\
              Chain: {chain}\n\
              Tx Hash: {tx_hash}\n\n\
@@ -158,7 +209,7 @@ impl EmailSender {
     </tr>
     <tr style="border-bottom: 1px solid #e5e7eb;">
       <td style="padding: 8px 0; color: #6b7280;">Amount</td>
-      <td style="padding: 8px 0; font-weight: 600;">{amount}</td>
+            <td style="padding: 8px 0; font-weight: 600;">{amount_display}</td>
     </tr>
     <tr style="border-bottom: 1px solid #e5e7eb;">
       <td style="padding: 8px 0; color: #6b7280;">Token</td>
@@ -226,13 +277,16 @@ impl EmailSender {
         trade_id: &str,
         session_id: &str,
         chain: &str,
-        sell_amount: &str,
-        received_amount: &str,
+        sell_amount_wei: &str,
+        received_amount_wei: &str,
         tx_hash: &str,
         status: &str,
         price_impact_bps: Option<f64>,
         failure_reason: Option<&str>,
     ) {
+        let sell_amount_display = format_wei_as_ether(sell_amount_wei);
+        let received_amount_display = format_wei_as_ether(received_amount_wei);
+
         let impact_display = price_impact_bps
             .map(|b| format!("{:.2} bps", b))
             .unwrap_or_else(|| "N/A".to_string());
@@ -254,8 +308,8 @@ impl EmailSender {
              Trade ID: {trade_id}\n\
              Session ID: {session_id}\n\
              Chain: {chain}\n\
-             Sell Amount: {sell_amount}\n\
-             Received Amount: {received_amount}\n\
+             Sell Amount: {sell_amount_display}\n\
+             Received Amount: {received_amount_display}\n\
              Price Impact: {impact_display}\n\
              Status: {status_label}\n\
              {failure_line}\
@@ -302,11 +356,11 @@ impl EmailSender {
     </tr>
     <tr style="border-bottom: 1px solid #e5e7eb;">
       <td style="padding: 8px 0; color: #6b7280;">Sell Amount</td>
-      <td style="padding: 8px 0; font-weight: 600;">{sell_amount}</td>
+            <td style="padding: 8px 0; font-weight: 600;">{sell_amount_display}</td>
     </tr>
     <tr style="border-bottom: 1px solid #e5e7eb;">
       <td style="padding: 8px 0; color: #6b7280;">Received Amount</td>
-      <td style="padding: 8px 0; font-weight: 600;">{received_amount}</td>
+            <td style="padding: 8px 0; font-weight: 600;">{received_amount_display}</td>
     </tr>
     <tr style="border-bottom: 1px solid #e5e7eb;">
       <td style="padding: 8px 0; color: #6b7280;">Price Impact</td>

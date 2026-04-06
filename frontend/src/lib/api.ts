@@ -5,6 +5,7 @@ import type {
   PoolInfo,
   Session,
   Trade,
+  SessionTradesResponse,
   SwapPath,
   TotpSetupResponse,
   UserProfile,
@@ -13,6 +14,7 @@ import type {
   AdminRefundRequest,
   AdminUser,
   WalletSession,
+  TokenUsdPrice,
 } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
@@ -241,7 +243,7 @@ class ApiClient {
   async getSessionTrades(
     sessionId: string,
     limit = 50,
-  ): Promise<{ trades: Trade[] }> {
+  ): Promise<SessionTradesResponse> {
     return this.request(
       `/api/v1/sessions/${sessionId}/trades?limit=${encodeURIComponent(limit)}`,
     );
@@ -328,7 +330,7 @@ class ApiClient {
   async getSessionTradesBySlug(
     slug: string,
     limit = 50,
-  ): Promise<{ trades: Trade[] }> {
+  ): Promise<SessionTradesResponse> {
     return this.request(
       `/api/v1/public/${slug}/trades?limit=${encodeURIComponent(limit)}`,
     );
@@ -345,6 +347,15 @@ class ApiClient {
   }> {
     return this.request(
       `/api/v1/tokens/metadata?chain=${encodeURIComponent(chain)}&address=${encodeURIComponent(address)}`,
+    );
+  }
+
+  async getTokenUsdPrice(
+    chain: string,
+    tokenAddress: string,
+  ): Promise<TokenUsdPrice> {
+    return this.request(
+      `/api/v1/tokens/usd-price?chain=${encodeURIComponent(chain)}&token_address=${encodeURIComponent(tokenAddress)}`,
     );
   }
 

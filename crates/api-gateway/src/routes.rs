@@ -1,3 +1,8 @@
+use alloy::{
+    primitives::{Address, U256},
+    providers::ProviderBuilder,
+    sol,
+};
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -13,10 +18,12 @@ use common::proto::{
 use common::types::{
     display_token_for_chain, is_native_token_placeholder, normalize_token_for_chain,
 };
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::cmp::Ordering;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{auth, jwt_middleware::AuthUser, SharedState};
@@ -193,6 +200,37 @@ fn clamp_trades_limit(limit: i64) -> i64 {
 pub struct TradesQuery {
     #[serde(default = "default_trades_limit")]
     pub limit: i64,
+}
+
+#[derive(Deserialize)]
+pub struct TokenUsdPriceQuery {
+    pub chain: String,
+    pub token_address: String,
+}
+
+#[derive(Serialize)]
+pub struct TokenUsdPriceResponse {
+    pub token_address: String,
+    pub usd_price: f64,
+    pub pool_address: String,
+    pub pool_version: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedOraclePool {
+    pool_address: String,
+    version: u8,
+}
+
+sol! {
+    #[sol(rpc)]
+    interface IPriceGetterV3 {
+        function getUsdPrice(
+            address token,
+            address pair,
+            uint8 version
+        ) external view returns (uint256);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1263,6 +1301,23 @@ pub async fn get_session_trades(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let limit = clamp_trades_limit(query.limit);
 
+    let total_received_raw = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(t.final_received, t.trigger_buy_amount))::text, '0')
+        FROM trades t
+        INNER JOIN sessions s ON s.id = t.session_id
+        WHERE t.session_id = $1
+          AND ($2::boolean OR s.user_id = $3)
+          AND t.status = 'confirmed'
+        "#,
+    )
+    .bind(session_id)
+    .bind(user.role == "admin")
+    .bind(user.user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let rows = sqlx::query(
         r#"
         SELECT
@@ -1278,13 +1333,15 @@ pub async fn get_session_trades(
             COALESCE(t.executed_at, t.created_at) AS executed_at
         FROM trades t
         INNER JOIN sessions s ON s.id = t.session_id
-        WHERE t.session_id = $1 AND s.user_id = $2
+                WHERE t.session_id = $1
+                    AND ($2::boolean OR s.user_id = $3)
         ORDER BY COALESCE(t.executed_at, t.created_at) DESC
-        LIMIT $3
+                LIMIT $4
         "#,
     )
     .bind(session_id)
-    .bind(user.user_id)
+        .bind(user.role == "admin")
+        .bind(user.user_id)
     .bind(limit)
     .fetch_all(&state.db)
     .await
@@ -1309,7 +1366,10 @@ pub async fn get_session_trades(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({ "trades": trades })))
+    Ok(Json(serde_json::json!({
+        "trades": trades,
+        "total_received": total_received_raw,
+    })))
 }
 
 pub async fn get_public_session_trades(
@@ -1318,6 +1378,21 @@ pub async fn get_public_session_trades(
     Query(query): Query<TradesQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let limit = clamp_trades_limit(query.limit);
+
+    let total_received_raw = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(t.final_received, t.trigger_buy_amount))::text, '0')
+        FROM trades t
+        INNER JOIN sessions s ON s.id = t.session_id
+        WHERE s.public_slug = $1
+          AND s.public_sharing_enabled = TRUE
+          AND t.status = 'confirmed'
+        "#,
+    )
+    .bind(&slug)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let rows = sqlx::query(
         r#"
@@ -1364,7 +1439,10 @@ pub async fn get_public_session_trades(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({ "trades": trades })))
+    Ok(Json(serde_json::json!({
+        "trades": trades,
+        "total_received": total_received_raw,
+    })))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1399,6 +1477,242 @@ pub async fn get_profile(
         "role": role,
         "created_at": created_at.to_rfc3339(),
     })))
+}
+
+fn token_pool_cache_key(chain: &str, token_address: &str) -> String {
+    format!(
+        "oracle_pool:{}:{}",
+        chain.trim().to_ascii_lowercase(),
+        token_address.trim().to_ascii_lowercase()
+    )
+}
+
+fn validate_hex_address(value: &str) -> bool {
+    let addr = value.trim();
+    addr.starts_with("0x") && addr.len() == 42 && hex::decode(&addr[2..]).is_ok()
+}
+
+fn parse_u256_amount(raw: &str) -> Option<U256> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let integral = trimmed.split('.').next().unwrap_or("").trim();
+    if integral.is_empty() {
+        return None;
+    }
+
+    integral.parse::<U256>().ok()
+}
+
+fn pool_type_to_version(pool_type: &str) -> Option<u8> {
+    match pool_type.trim().to_ascii_lowercase().as_str() {
+        "v2" => Some(2),
+        "v3" => Some(3),
+        _ => None,
+    }
+}
+
+fn pool_token_liquidity_metric(pool: &PoolInfo, token_address: &str) -> Option<U256> {
+    let token_is_0 = pool.token0.eq_ignore_ascii_case(token_address);
+    let token_is_1 = pool.token1.eq_ignore_ascii_case(token_address);
+    if !token_is_0 && !token_is_1 {
+        return None;
+    }
+
+    match pool.pool_type.trim().to_ascii_lowercase().as_str() {
+        "v2" => {
+            let raw = if token_is_0 {
+                pool.reserve0.as_str()
+            } else {
+                pool.reserve1.as_str()
+            };
+            parse_u256_amount(raw)
+        }
+        "v3" => {
+            let raw = if token_is_0 {
+                pool.balance0.as_str()
+            } else {
+                pool.balance1.as_str()
+            };
+            parse_u256_amount(raw)
+        }
+        _ => None,
+    }
+}
+
+fn choose_best_oracle_pool(pools: &[PoolInfo], token_address: &str) -> Option<CachedOraclePool> {
+    let mut best: Option<(U256, CachedOraclePool)> = None;
+    let mut fallback: Option<CachedOraclePool> = None;
+
+    for pool in pools {
+        let Some(version) = pool_type_to_version(&pool.pool_type) else {
+            continue;
+        };
+
+        let entry = CachedOraclePool {
+            pool_address: pool.pool_address.clone(),
+            version,
+        };
+
+        if fallback.is_none() {
+            fallback = Some(entry.clone());
+        }
+
+        let Some(metric) = pool_token_liquidity_metric(pool, token_address) else {
+            continue;
+        };
+        if metric.is_zero() {
+            continue;
+        }
+
+        match &best {
+            Some((best_metric, _)) if metric.cmp(best_metric) != Ordering::Greater => {}
+            _ => best = Some((metric, entry)),
+        }
+    }
+
+    best.map(|(_, entry)| entry).or(fallback)
+}
+
+async fn resolve_cached_oracle_pool(
+    state: &SharedState,
+    chain: &str,
+    token_address: &str,
+    force_refresh: bool,
+) -> Result<(CachedOraclePool, bool), StatusCode> {
+    let cache_key = token_pool_cache_key(chain, token_address);
+    let mut redis = state.redis.clone();
+
+    if !force_refresh {
+        if let Ok(Some(cached)) = redis.get::<_, Option<String>>(&cache_key).await {
+            if let Ok(entry) = serde_json::from_str::<CachedOraclePool>(&cached) {
+                if validate_hex_address(&entry.pool_address)
+                    && (entry.version == 2 || entry.version == 3)
+                {
+                    return Ok((entry, true));
+                }
+            }
+        }
+    }
+
+    let mut client = SessionServiceClient::connect(state.session_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let resp = client
+        .discover_pools(DiscoverPoolsRequest {
+            chain: chain.to_string(),
+            token_address: token_address.to_string(),
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .into_inner();
+
+    let Some(selected) = choose_best_oracle_pool(&resp.pools, token_address) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    if let Ok(serialized) = serde_json::to_string(&selected) {
+        if let Err(e) = redis.set::<_, _, ()>(&cache_key, serialized).await {
+            warn!(chain = %chain, token = %token_address, error = %e, "Failed to cache oracle pool mapping");
+        }
+    }
+
+    Ok((selected, false))
+}
+
+async fn fetch_oracle_usd_price_36(
+    rpc_url: &str,
+    oracle_address: Address,
+    token_address: &str,
+    pool: &CachedOraclePool,
+) -> Result<U256, anyhow::Error> {
+    let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid rpc_url: {e}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+    let token: Address = token_address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
+    let pair: Address = pool
+        .pool_address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid pool address: {e}"))?;
+
+    let oracle = IPriceGetterV3::new(oracle_address, &provider);
+    let quote = oracle
+        .getUsdPrice(token, pair, pool.version)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("Oracle getUsdPrice failed: {e}"))?;
+
+    Ok(quote)
+}
+
+pub async fn get_token_usd_price(
+    State(state): State<SharedState>,
+    Extension(_user): Extension<AuthUser>,
+    Query(query): Query<TokenUsdPriceQuery>,
+) -> Result<Json<TokenUsdPriceResponse>, StatusCode> {
+    let chain = query.chain.trim().to_ascii_lowercase();
+    if chain.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let normalized_token =
+        normalize_token_for_chain(&chain, query.token_address.trim()).to_ascii_lowercase();
+    if !validate_hex_address(&normalized_token) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let cfg = liquifier_config::Settings::global();
+    let chain_cfg = cfg.chains.get(&chain).ok_or(StatusCode::BAD_REQUEST)?;
+    let rpc_url = chain_cfg.rpc_url.trim();
+    if rpc_url.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let oracle_address: Address = cfg
+        .execution
+        .buy_trigger_oracle_address
+        .parse()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (mut pool, from_cache) =
+        resolve_cached_oracle_pool(&state, &chain, &normalized_token, false).await?;
+
+    let usd_price_36 =
+        match fetch_oracle_usd_price_36(rpc_url, oracle_address, &normalized_token, &pool).await {
+            Ok(value) => value,
+            Err(err) if from_cache => {
+                warn!(
+                    chain = %chain,
+                    token = %normalized_token,
+                    pool = %pool.pool_address,
+                    error = %err,
+                    "Cached oracle pool failed, refreshing pool selection"
+                );
+                let refreshed =
+                    resolve_cached_oracle_pool(&state, &chain, &normalized_token, true).await?;
+                pool = refreshed.0;
+                fetch_oracle_usd_price_36(rpc_url, oracle_address, &normalized_token, &pool)
+                    .await
+                    .map_err(|_| StatusCode::BAD_GATEWAY)?
+            }
+            Err(_) => return Err(StatusCode::BAD_GATEWAY),
+        };
+
+    let usd_price = usd_price_36.to_string().parse::<f64>().unwrap_or(0.0) / 1e36_f64;
+
+    Ok(Json(TokenUsdPriceResponse {
+        token_address: query.token_address,
+        usd_price,
+        pool_address: pool.pool_address,
+        pool_version: pool.version,
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────
