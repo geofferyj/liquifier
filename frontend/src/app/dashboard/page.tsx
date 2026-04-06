@@ -1,9 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { QRCodeSVG } from "qrcode.react";
 import { api } from "@/lib/api";
+import { useAuthStore } from "@/lib/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,15 +14,25 @@ import { cn, shortenAddress } from "@/lib/utils";
 import type { SessionStatus } from "@/lib/types";
 
 export default function DashboardPage() {
+  const router = useRouter();
+  const role = useAuthStore((s) => s.role);
+  const hydrated = useAuthStore((s) => s.hydrated);
+
+  useEffect(() => {
+    if (hydrated && role && role !== "admin") router.replace("/my-dashboard");
+  }, [hydrated, role, router]);
+
   const sessionsQuery = useQuery({
     queryKey: ["sessions"],
     queryFn: () => api.listSessions(),
     refetchInterval: 30_000,
+    enabled: hydrated,
   });
 
   const walletsQuery = useQuery({
     queryKey: ["wallets"],
     queryFn: () => api.listWallets(),
+    enabled: hydrated,
   });
 
   const createWalletMutation = useMutation({
@@ -62,11 +75,19 @@ export default function DashboardPage() {
   const sessions = sessionsQuery.data?.sessions ?? [];
   const wallets = walletsQuery.data?.wallets ?? [];
 
+  if (!hydrated) return null;
+
   return (
     <main className="min-h-screen p-8 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold">Dashboard</h1>
         <div className="flex gap-2">
+          <Link href="/admin/users">
+            <Button variant="secondary">Manage Users</Button>
+          </Link>
+          <Link href="/admin/refunds">
+            <Button variant="secondary">Refund Requests</Button>
+          </Link>
           <Link href="/dashboard/settings">
             <Button variant="secondary">Settings</Button>
           </Link>
@@ -84,38 +105,50 @@ export default function DashboardPage() {
       <Card className="mb-8">
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>Wallets</CardTitle>
-          <Button
-            size="sm"
-            onClick={() => createWalletMutation.mutate()}
-            disabled={createWalletMutation.isPending}
-          >
-            {createWalletMutation.isPending ? "Creating..." : "Create Wallet"}
-          </Button>
+          {wallets.length === 0 && (
+            <Button
+              size="sm"
+              onClick={() => createWalletMutation.mutate()}
+              disabled={createWalletMutation.isPending}
+            >
+              {createWalletMutation.isPending ? "Creating..." : "Create Wallet"}
+            </Button>
+          )}
         </CardHeader>
         <CardContent>
           {wallets.length === 0 ? (
             <p className="text-sm text-muted-foreground">No wallets yet. Create one to get started.</p>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-4">
               {wallets.map((w) => (
                 <div
                   key={w.wallet_id}
-                  className="flex items-center justify-between p-3 rounded-lg bg-muted/50"
+                  className="flex flex-col sm:flex-row gap-4 p-4 rounded-lg bg-muted/50"
                 >
-                  <div>
-                    <code className="text-sm">{w.address}</code>
-                    <p className="text-xs text-muted-foreground mt-0.5">
-                      Created {new Date(w.created_at).toLocaleDateString()}
-                    </p>
+                  {/* QR Code */}
+                  <div className="flex-shrink-0 flex justify-center">
+                    <div className="bg-white p-2 rounded-lg">
+                      <QRCodeSVG value={w.address} size={120} />
+                    </div>
                   </div>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => handleExportRequest(w.wallet_id)}
-                    disabled={exportingId === w.wallet_id}
-                  >
-                    {exportingId === w.wallet_id ? "Exporting..." : "Backup"}
-                  </Button>
+
+                  {/* Details */}
+                  <div className="flex-1 flex items-center justify-between">
+                    <div>
+                      <code className="text-sm break-all select-all">{w.address}</code>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {w.chain?.toUpperCase()} · Created {new Date(w.created_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleExportRequest(w.wallet_id)}
+                      disabled={exportingId === w.wallet_id}
+                    >
+                      {exportingId === w.wallet_id ? "Exporting..." : "Backup"}
+                    </Button>
+                  </div>
                 </div>
               ))}
             </div>

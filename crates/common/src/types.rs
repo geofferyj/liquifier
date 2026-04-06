@@ -16,12 +16,50 @@ pub struct DexSwapEvent {
     pub sender: String,
     pub recipient: String,
     pub timestamp: u64,
+    /// true when token0 is the input (sold into pool) and token1 is the output.
+    /// false when token1 is the input and token0 is the output.
+    /// Used by the execution engine to resolve actual token addresses from pool config.
+    #[serde(default)]
+    pub token0_is_input: bool,
+}
+
+/// ERC-20 Transfer event detected to a known user wallet, published to NATS
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepositEvent {
+    pub chain: String,
+    pub block_number: u64,
+    pub tx_hash: String,
+    pub log_index: u32,
+    pub token_address: String,
+    pub from: String,
+    pub to: String,     // wallet address that received the deposit
+    pub amount: String, // U256 decimal string
+    pub wallet_id: String,
+    pub user_id: String,
+}
+
+/// Trade completion event published by the execution engine to NATS
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeCompletedEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub trade_id: String,
+    pub session_id: String,
+    pub chain: String,
+    pub sell_amount: String,
+    pub received_amount: String,
+    pub tx_hash: String,
+    pub price_impact_bps: Option<f64>,
+    pub executed_at: Option<String>,
+    pub status: String,
+    pub failure_reason: Option<String>,
 }
 
 /// NATS subject constants
 pub const SUBJECT_DEX_SWAPS: &str = "evm.dex.swaps";
 pub const SUBJECT_TRADES_COMPLETED: &str = "trades.completed";
 pub const SUBJECT_SESSION_UPDATES: &str = "session.updates";
+pub const SUBJECT_DEPOSITS: &str = "evm.deposits";
 
 /// Special placeholder address used by many UIs to represent the native gas token.
 pub const NATIVE_TOKEN_PLACEHOLDER: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -233,6 +271,7 @@ mod tests {
             sender: "0xsender".to_string(),
             recipient: "0xrecipient".to_string(),
             timestamp: 1700000000,
+            token0_is_input: true,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: DexSwapEvent = serde_json::from_str(&json).unwrap();

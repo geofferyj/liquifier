@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Session, Trade, WsMessage } from "./types";
+import type { Session, Trade, WsMessage, UserRole } from "./types";
 
 // ─────────────────────────────────────────────────────────────
 // Auth Store
@@ -7,27 +7,40 @@ import type { Session, Trade, WsMessage } from "./types";
 
 interface AuthState {
   userId: string | null;
+  role: UserRole | null;
   isAuthenticated: boolean;
-  setAuth: (userId: string) => void;
+  hydrated: boolean;
+  setAuth: (userId: string, role?: UserRole) => void;
   clearAuth: () => void;
+  hydrate: () => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
-  userId:
-    typeof window !== "undefined" ? localStorage.getItem("user_id") : null,
-  isAuthenticated:
-    typeof window !== "undefined"
-      ? !!localStorage.getItem("access_token")
-      : false,
-  setAuth: (userId) => {
+  userId: null,
+  role: null,
+  isAuthenticated: false,
+  hydrated: false,
+  setAuth: (userId, role) => {
     localStorage.setItem("user_id", userId);
-    set({ userId, isAuthenticated: true });
+    if (role) localStorage.setItem("user_role", role);
+    set({
+      userId,
+      role: role ?? (localStorage.getItem("user_role") as UserRole | null),
+      isAuthenticated: true,
+    });
   },
   clearAuth: () => {
     localStorage.removeItem("user_id");
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
-    set({ userId: null, isAuthenticated: false });
+    localStorage.removeItem("user_role");
+    set({ userId: null, role: null, isAuthenticated: false });
+  },
+  hydrate: () => {
+    const userId = localStorage.getItem("user_id");
+    const role = localStorage.getItem("user_role") as UserRole | null;
+    const isAuthenticated = !!localStorage.getItem("access_token");
+    set({ userId, role, isAuthenticated, hydrated: true });
   },
 }));
 

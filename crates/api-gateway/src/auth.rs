@@ -35,11 +35,25 @@ pub struct Claims {
     pub exp: usize,
     pub iat: usize,
     pub token_type: String, // "access" or "refresh"
+    #[serde(default = "default_role")]
+    pub role: String, // "admin" or "common"
+}
+
+fn default_role() -> String {
+    "admin".to_string()
 }
 
 pub fn create_access_token(
     user_id: &Uuid,
     secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    create_access_token_with_role(user_id, secret, "admin")
+}
+
+pub fn create_access_token_with_role(
+    user_id: &Uuid,
+    secret: &str,
+    role: &str,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
@@ -47,6 +61,7 @@ pub fn create_access_token(
         iat: now.timestamp() as usize,
         exp: (now + Duration::hours(1)).timestamp() as usize,
         token_type: "access".to_string(),
+        role: role.to_string(),
     };
     encode(
         &Header::default(),
@@ -59,12 +74,21 @@ pub fn create_refresh_token(
     user_id: &Uuid,
     secret: &str,
 ) -> Result<String, jsonwebtoken::errors::Error> {
+    create_refresh_token_with_role(user_id, secret, "admin")
+}
+
+pub fn create_refresh_token_with_role(
+    user_id: &Uuid,
+    secret: &str,
+    role: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
         sub: user_id.to_string(),
         iat: now.timestamp() as usize,
         exp: (now + Duration::days(7)).timestamp() as usize,
         token_type: "refresh".to_string(),
+        role: role.to_string(),
     };
     encode(
         &Header::default(),
@@ -199,6 +223,7 @@ mod tests {
             iat: (now - Duration::hours(2)).timestamp() as usize,
             exp: (now - Duration::hours(1)).timestamp() as usize, // expired 1hr ago
             token_type: "access".to_string(),
+            role: "admin".to_string(),
         };
         let token = encode(
             &Header::default(),

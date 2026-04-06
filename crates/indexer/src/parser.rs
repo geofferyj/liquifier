@@ -80,7 +80,8 @@ fn parse_v2_swap(
     let amount1_out = U256::from_be_slice(&data[96..128]);
 
     // Determine direction: if amount0In > 0 => token0 is being sold (incoming), token1 is output
-    let (amount_in, amount_out) = if !amount0_in.is_zero() {
+    let token0_is_input = !amount0_in.is_zero();
+    let (amount_in, amount_out) = if token0_is_input {
         (amount0_in, amount1_out)
     } else {
         (amount1_in, amount0_out)
@@ -100,6 +101,7 @@ fn parse_v2_swap(
         sender,
         recipient,
         timestamp: 0, // Set from block timestamp if needed
+        token0_is_input,
     }))
 }
 
@@ -133,7 +135,8 @@ fn parse_v3_swap(
     let amount1_negative = amount1_raw.bit(255);
 
     // Determine amounts: positive = input, negative = output
-    let (amount_in, amount_out) = if !amount0_negative {
+    let token0_is_input = !amount0_negative;
+    let (amount_in, amount_out) = if token0_is_input {
         // amount0 is positive (token0 in), amount1 is negative (token1 out)
         let out = if amount1_negative {
             // Two's complement for absolute value
@@ -162,6 +165,7 @@ fn parse_v3_swap(
         sender,
         recipient,
         timestamp: 0,
+        token0_is_input,
     }))
 }
 
@@ -256,6 +260,7 @@ mod tests {
         assert_eq!(event.log_index, 3);
         assert_eq!(event.amount_in, "1000");
         assert_eq!(event.amount_out, "500");
+        assert!(event.token0_is_input, "token0 was input (amount0In > 0)");
     }
 
     #[test]
@@ -286,6 +291,7 @@ mod tests {
         let event = parse_swap_log("ethereum", &log).unwrap().unwrap();
         assert_eq!(event.amount_in, "2000");
         assert_eq!(event.amount_out, "800");
+        assert!(!event.token0_is_input, "token1 was input (amount1In > 0)");
     }
 
     #[test]
@@ -357,6 +363,7 @@ mod tests {
         assert_eq!(event.dex_type, "uniswap_v3");
         assert_eq!(event.amount_in, "500");
         assert_eq!(event.amount_out, "300");
+        assert!(event.token0_is_input, "amount0 positive = token0 is input");
     }
 
     #[test]
@@ -390,6 +397,7 @@ mod tests {
         let event = parse_swap_log("ethereum", &log).unwrap().unwrap();
         assert_eq!(event.amount_in, "1000");
         assert_eq!(event.amount_out, "700");
+        assert!(!event.token0_is_input, "amount0 negative = token1 is input");
     }
 
     #[test]

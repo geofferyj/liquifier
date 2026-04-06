@@ -13,6 +13,7 @@ use crate::{auth, SharedState};
 #[derive(Clone, Debug)]
 pub struct AuthUser {
     pub user_id: Uuid,
+    pub role: String,
 }
 
 /// Middleware that validates JWT from the Authorization header.
@@ -31,8 +32,8 @@ pub async fn require_auth(
         .strip_prefix("Bearer ")
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let token_data = auth::validate_token(token, &state.jwt_secret)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let token_data =
+        auth::validate_token(token, &state.jwt_secret).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     if token_data.claims.token_type != "access" {
         return Err(StatusCode::UNAUTHORIZED);
@@ -44,7 +45,10 @@ pub async fn require_auth(
         .parse()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    request.extensions_mut().insert(AuthUser { user_id });
+    request.extensions_mut().insert(AuthUser {
+        user_id,
+        role: token_data.claims.role,
+    });
 
     Ok(next.run(request).await)
 }

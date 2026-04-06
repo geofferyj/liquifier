@@ -24,6 +24,8 @@ export interface AuthResponse {
   user_id: string;
 }
 
+export type UserRole = "admin" | "common";
+
 export type AuthStatus =
   | "authenticated"
   | "email_verification_required"
@@ -36,6 +38,7 @@ export interface LoginResponse {
   message?: string;
   access_token?: string;
   refresh_token?: string;
+  role?: UserRole;
 }
 
 export interface SignupResponse {
@@ -43,6 +46,7 @@ export interface SignupResponse {
   user_id: string;
   message?: string;
   access_token?: string;
+  role?: UserRole;
 }
 
 export interface Wallet {
@@ -50,6 +54,11 @@ export interface Wallet {
   address: string;
   chain: string;
   created_at: string;
+}
+
+export interface AdminWallet extends Wallet {
+  owner_id: string;
+  owner_name: string;
 }
 
 export interface SwapPath {
@@ -148,12 +157,76 @@ export type WsMessage = WsSessionUpdate | WsTradeCompleted;
 export interface UserProfile {
   user_id: string;
   email: string;
+  username?: string;
   email_verified: boolean;
   totp_enabled: boolean;
+  role: UserRole;
 }
 
 export interface TotpSetupResponse {
   secret: string;
   otpauth_url: string;
   qr_code_base64: string;
+}
+
+export interface RefundRequest {
+  refund_id: string;
+  wallet_id: string;
+  amount: string;
+  token_address: string;
+  token_symbol: string;
+  status: string;
+  admin_note?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminRefundRequest extends RefundRequest {
+  user_id: string;
+  email: string;
+  username?: string;
+}
+
+export interface AdminUser {
+  user_id: string;
+  email: string;
+  username?: string;
+  role: UserRole;
+  email_verified: boolean;
+  totp_enabled: boolean;
+  wallet_count: number;
+  session_count: number;
+  created_at: string;
+}
+
+export interface AdminUserSession {
+  session_id: string;
+  status: string;
+  sell_token_symbol: string;
+  target_token_symbol: string;
+  sell_token_decimals: number;
+  target_token_decimals: number;
+  chain: string;
+  total_amount: string;
+  amount_sold: string;
+  pov_percent: number;
+  strategy: string;
+  wallet_address: string;
+  public_slug?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WalletSession {
+  session_id: string;
+  status: string;
+  sell_token_symbol: string;
+  target_token_symbol: string;
+  chain: string;
+  total_amount: string;
+  amount_sold: string;
+  pov_percent: number;
+  wallet_address: string;
+  public_slug?: string;
+  created_at: string;
 }

@@ -12,6 +12,7 @@ export default function SignupPage() {
   const router = useRouter();
 
   const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
@@ -30,18 +31,14 @@ export default function SignupPage() {
       setError("Password must be at least 8 characters");
       return;
     }
+    if (username.length < 3) {
+      setError("Username must be at least 3 characters");
+      return;
+    }
 
     setLoading(true);
     try {
-      const res = await api.signup(email, password);
-
-      if (res.status === "totp_setup_required") {
-        // Email already verified, needs TOTP setup
-        router.push("/setup-2fa");
-        return;
-      }
-
-      // Default: email verification required
+      await api.signup(email, password, "common", username);
       setSubmitted(true);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Signup failed");
@@ -66,7 +63,8 @@ export default function SignupPage() {
               Please check your inbox and click the link to verify your account.
             </p>
             <p className="text-xs text-muted-foreground">
-              After verifying your email, you&apos;ll be asked to set up 2FA.
+              After verifying your email, you can sign in directly. A wallet
+              will be created automatically for you.
             </p>
             <Link href="/login">
               <Button variant="secondary" className="w-full mt-4">
@@ -87,6 +85,21 @@ export default function SignupPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSignup} className="space-y-4">
+            <div>
+              <label className="text-sm text-muted-foreground">
+                Username
+              </label>
+              <Input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                required
+                minLength={3}
+                maxLength={50}
+                autoComplete="username"
+              />
+            </div>
+
             <div>
               <label className="text-sm text-muted-foreground">Email</label>
               <Input
@@ -123,9 +136,7 @@ export default function SignupPage() {
               />
             </div>
 
-            {error && (
-              <p className="text-sm text-destructive">{error}</p>
-            )}
+            {error && <p className="text-sm text-destructive">{error}</p>}
 
             <Button type="submit" className="w-full" disabled={loading}>
               {loading ? "Creating account..." : "Sign Up"}

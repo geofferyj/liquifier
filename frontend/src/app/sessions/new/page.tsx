@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { Chain, PoolInfo, SwapPath } from "@/lib/types";
+import { useAuthStore } from "@/lib/store";
+import type { AdminWallet, Chain, PoolInfo, SwapPath } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -131,6 +133,13 @@ function formatUsd(value: number): string {
 }
 
 export default function SessionCreatePage() {
+  const router = useRouter();
+  const role = useAuthStore((s) => s.role);
+
+  useEffect(() => {
+    if (role && role !== "admin") router.replace("/my-dashboard");
+  }, [role, router]);
+
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<WizardState>(INITIAL_STATE);
 
@@ -138,8 +147,9 @@ export default function SessionCreatePage() {
   const [balanceLoading, setBalanceLoading] = useState(false);
 
   const walletsQuery = useQuery({
-    queryKey: ["wallets"],
-    queryFn: () => api.listWallets(),
+    queryKey: role === "admin" ? ["admin-all-wallets"] : ["wallets"],
+    queryFn: () =>
+      role === "admin" ? api.adminListAllWallets() : api.listWallets(),
   });
 
   const chainsQuery = useQuery({
@@ -449,6 +459,7 @@ export default function SessionCreatePage() {
   };
 
   const wallets = walletsQuery.data?.wallets ?? [];
+  const adminWallets = wallets as AdminWallet[];
 
   // Computed: selected pools that have successfully computed paths
   const selectedPoolsWithPath = form.discoveredPools.filter(
@@ -546,11 +557,17 @@ export default function SessionCreatePage() {
                   className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm"
                 >
                   <option value="">Select wallet...</option>
-                  {wallets.map((w) => (
-                    <option key={w.wallet_id} value={w.wallet_id}>
-                      {w.address}
-                    </option>
-                  ))}
+                  {role === "admin"
+                    ? adminWallets.map((w) => (
+                        <option key={w.wallet_id} value={w.wallet_id}>
+                          {w.owner_name} — {w.address}
+                        </option>
+                      ))
+                    : wallets.map((w) => (
+                        <option key={w.wallet_id} value={w.wallet_id}>
+                          {w.address}
+                        </option>
+                      ))}
                 </select>
               )}
             </div>
@@ -565,6 +582,16 @@ export default function SessionCreatePage() {
                 value={form.sellToken}
                 onChange={(e) => update({ sellToken: e.target.value })}
               />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted-foreground">Shortcuts:</span>
+                <button
+                  type="button"
+                  className="px-2 py-1 text-xs rounded border border-border hover:border-primary transition-colors"
+                  onClick={() => update({ sellToken: "0x6Ec90334d89dBdc89E08A133271be3d104128Edb" })}
+                >
+                  WKC
+                </button>
+              </div>
               {form.sellTokenMeta && <TokenMetaCard meta={form.sellTokenMeta} />}
             </div>
 

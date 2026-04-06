@@ -32,8 +32,12 @@ export default function LoginPage() {
 
       switch (res.status) {
         case "authenticated":
-          setAuth(res.user_id);
-          router.push("/dashboard");
+          setAuth(res.user_id, res.role);
+          if (res.role === "common") {
+            router.push("/my-dashboard");
+          } else {
+            router.push("/dashboard");
+          }
           break;
 
         case "email_verification_required":

@@ -8,7 +8,6 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use common::{
-    pricing::{ChainlinkPriceFetcher, PriceCache},
     proto::{
         session_service_client::SessionServiceClient, wallet_kms_client::WalletKmsClient,
         ActiveSessionsQuery, SessionInfo, SignTransactionRequest,
@@ -27,7 +26,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::transport::Channel;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod impact;
 
@@ -41,7 +40,7 @@ struct EngineState {
     kms_client: WalletKmsClient<Channel>,
     session_client: SessionServiceClient<Channel>,
     redis: redis::aio::ConnectionManager,
-    price_cache: PriceCache,
+    buy_trigger_oracle: Address,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,10 +56,13 @@ sol! {
     interface IERC20Approve {
         function approve(address spender, uint256 amount) external returns (bool);
         function allowance(address owner, address spender) external view returns (uint256);
+        function balanceOf(address account) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
     }
 }
 
 sol! {
+    #[sol(rpc)]
     interface IUniswapV2Router {
         function swapExactTokensForTokens(
             uint256 amountIn,
@@ -92,6 +94,11 @@ sol! {
             address to,
             uint256 deadline
         ) external;
+
+        function getAmountsOut(
+            uint256 amountIn,
+            address[] calldata path
+        ) external view returns (uint256[] memory amounts);
     }
 
     interface IUniswapV3Router {
@@ -107,6 +114,17 @@ sol! {
             external
             payable
             returns (uint256 amountOut);
+    }
+}
+
+sol! {
+    #[sol(rpc)]
+    interface IPriceGetterV3 {
+        function getUsdPrice(
+            address token,
+            address pair,
+            uint8 version
+        ) external view returns (uint256);
     }
 }
 
@@ -127,6 +145,16 @@ async fn main() -> Result<()> {
     let kms_addr = cfg.kms.grpc_addr.clone();
     let session_addr = cfg.session_api.grpc_addr.clone();
     let redis_url = &cfg.redis.url;
+    let buy_trigger_oracle: Address = cfg
+        .execution
+        .buy_trigger_oracle_address
+        .parse()
+        .with_context(|| {
+            format!(
+                "Invalid execution.buy_trigger_oracle_address: {}",
+                cfg.execution.buy_trigger_oracle_address
+            )
+        })?;
 
     // Database
     let db = PgPoolOptions::new()
@@ -176,16 +204,8 @@ async fn main() -> Result<()> {
         kms_client,
         session_client,
         redis: redis_conn,
-        price_cache: PriceCache::new(),
+        buy_trigger_oracle,
     });
-
-    // Start background price updater for oracle-backed trigger thresholds
-    let price_interval = cfg.pricing.update_interval_secs;
-    let fetcher = Arc::new(ChainlinkPriceFetcher::new());
-    let _price_updater = state
-        .price_cache
-        .clone()
-        .start_updater(fetcher, price_interval);
 
     info!("Execution Engine worker starting — subscribing to DEX swap events");
 
@@ -224,8 +244,9 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let process_result = match serde_json::from_slice::<DexSwapEvent>(&payload) {
                 Ok(event) => {
+                    let block_number = event.block_number;
                     if let Err(e) = process_swap_event(&state, event).await {
-                        error!(error = %e, "Failed to process swap event");
+                        error!(block_number = block_number, error = %e, "Failed to process swap event");
                         Err(e)
                     } else {
                         Ok(())
@@ -283,36 +304,102 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
     for session in &response.sessions {
         // Pool match is guaranteed by the session-api query (JOIN on session_pools)
 
+        let Some(pool_cfg) = session
+            .pools
+            .iter()
+            .find(|p| p.pool_address.eq_ignore_ascii_case(&event.pool_address))
+        else {
+            warn!(
+                session_id = %session.session_id,
+                block_number = event.block_number,
+                pool = %event.pool_address,
+                "Skipping trade: pool config missing, cannot determine swap direction"
+            );
+            continue;
+        };
+
+        // ── Direction check: only trigger when someone BOUGHT the sell_token ──
+        // The session sells `sell_token` proportionally when others buy it.
+        // Resolve which token is amount_out using the pool's token0/token1 config
+        // and the event's token0_is_input flag from the indexer.
+        // token0_is_input=true  → amount_out is token1
+        // token0_is_input=false → amount_out is token0
+        let resolved_token_out = if event.token0_is_input {
+            pool_cfg.token1.as_str()
+        } else {
+            pool_cfg.token0.as_str()
+        };
+
+        // Only trigger our sell if the on-chain swap's output is the session's sell_token.
+        // That means someone BOUGHT sell_token, which is the signal for us to sell too.
+        if !resolved_token_out.eq_ignore_ascii_case(&session.sell_token) {
+            debug!(
+                session_id = %session.session_id,
+                block_number = event.block_number,
+                resolved_token_out = %resolved_token_out,
+                sell_token = %session.sell_token,
+                pool = %event.pool_address,
+                "Skipping: swap output is not the sell token (not a buy of sell_token)"
+            );
+            continue;
+        }
+
+        let Some(pool_type) = pool_type_from_str(&pool_cfg.pool_type) else {
+            warn!(
+                session_id = %session.session_id,
+                block_number = event.block_number,
+                pool = %event.pool_address,
+                pool_type = %pool_cfg.pool_type,
+                "Skipping trade: unsupported pool type"
+            );
+            continue;
+        };
+
         // 2. Check minimum buy trigger using oracle-derived USD valuation
         let min_trigger_usd = session.min_buy_trigger_usd;
         if min_trigger_usd > 0.0 {
-            let buy_usd = estimate_token_usd_value(
-                &state.price_cache,
+            let buy_usd = match fetch_buy_amount_usd_from_oracle(
                 &session.chain,
-                &event.token_out,
+                state.buy_trigger_oracle,
+                resolved_token_out,
+                &event.pool_address,
+                pool_type_to_oracle_version(pool_type),
                 buy_amount,
-                session.target_token_decimals,
-                &event.token_in,
-            );
-            match buy_usd {
-                Some(usd) if usd < min_trigger_usd => {
-                    info!(
-                        session_id = %session.session_id,
-                        buy_usd = usd,
-                        min_trigger_usd = min_trigger_usd,
-                        "Skipping trade: buy amount below USD trigger threshold"
-                    );
-                    continue;
-                }
-                None => {
+                session.sell_token_decimals,
+            )
+            .await
+            {
+                Ok(Some(usd)) => usd,
+                Ok(None) => {
                     warn!(
                         session_id = %session.session_id,
-                        token = %event.token_out,
-                        "Skipping trade: no oracle price available for trigger token"
+                        block_number = event.block_number,
+                        token = %resolved_token_out,
+                        "Skipping trade: unusable oracle response for trigger token"
                     );
                     continue;
                 }
-                _ => {} // trigger met
+                Err(e) => {
+                    warn!(
+                        session_id = %session.session_id,
+                        block_number = event.block_number,
+                        token = %resolved_token_out,
+                        error = %e,
+                        "Skipping trade: failed to fetch oracle USD price for trigger token"
+                    );
+                    continue;
+                }
+            };
+
+            if buy_usd < min_trigger_usd {
+                info!(
+                    session_id = %session.session_id,
+                    block_number = event.block_number,
+                    buy_usd = buy_usd,
+                    min_trigger_usd = min_trigger_usd,
+                    "Skipping trade: buy amount below USD trigger threshold"
+                );
+                continue;
             }
         }
 
@@ -331,33 +418,11 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
 
         let sell_amount = sell_amount.min(remaining);
 
-        let Some(pool_cfg) = session
-            .pools
-            .iter()
-            .find(|p| p.pool_address.eq_ignore_ascii_case(&event.pool_address))
-        else {
-            warn!(
-                session_id = %session.session_id,
-                pool = %event.pool_address,
-                "Skipping trade: pool metadata missing from session"
-            );
-            continue;
-        };
-
-        let Some(pool_type) = pool_type_from_str(&pool_cfg.pool_type) else {
-            warn!(
-                session_id = %session.session_id,
-                pool = %event.pool_address,
-                pool_type = %pool_cfg.pool_type,
-                "Skipping trade: unsupported pool type"
-            );
-            continue;
-        };
-
         let Some(route) = parse_pool_swap_route(&pool_cfg.swap_path_json, &event.pool_address)
         else {
             warn!(
                 session_id = %session.session_id,
+                block_number = event.block_number,
                 pool = %event.pool_address,
                 "Skipping trade: missing or invalid per-pool route"
             );
@@ -367,6 +432,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
         let Some(sell_token) = route.hop_tokens.first() else {
             warn!(
                 session_id = %session.session_id,
+                block_number = event.block_number,
                 pool = %event.pool_address,
                 "Skipping trade: route missing sell token"
             );
@@ -387,6 +453,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             Err(e) => {
                 warn!(
                     session_id = %session.session_id,
+                    block_number = event.block_number,
                     pool = %event.pool_address,
                     error = %e,
                     "Skipping trade: failed to compute price impact"
@@ -403,6 +470,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
         if price_impact_bps > max_impact_bps {
             warn!(
                 session_id = %session.session_id,
+                block_number = event.block_number,
                 impact_bps = price_impact_bps,
                 session_max_bps = session_max_impact_bps,
                 global_max_bps = global_max_impact_bps,
@@ -414,6 +482,9 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
 
         info!(
             session_id = %session.session_id,
+            block_number = event.block_number,
+            buy_tx = %event.tx_hash,
+            buy_amount = %event.amount_out,
             sell_amount = %sell_amount,
             impact_bps = price_impact_bps,
             max_bps = max_impact_bps,
@@ -426,6 +497,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
         else {
             warn!(
                 session_id = %session.session_id,
+                block_number = event.block_number,
                 chain = %session.chain,
                 dex = %pool_cfg.dex_name,
                 pool_type = %pool_cfg.pool_type,
@@ -437,6 +509,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
         let Ok(router_address) = router_address.parse::<Address>() else {
             warn!(
                 session_id = %session.session_id,
+                block_number = event.block_number,
                 chain = %session.chain,
                 dex = %pool_cfg.dex_name,
                 "Skipping trade: configured router address is invalid"
@@ -452,6 +525,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                 Err(e) => {
                     warn!(
                         session_id = %session.session_id,
+                        block_number = event.block_number,
                         wallet_id = %session.wallet_id,
                         error = %e,
                         "Skipping trade: failed to resolve session wallet recipient"
@@ -476,6 +550,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             {
                 warn!(
                     session_id = %session.session_id,
+                    block_number = event.block_number,
                     pool = %event.pool_address,
                     error = %e,
                     "Skipping trade: failed to ensure token approval for router"
@@ -484,23 +559,56 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             }
         }
 
-        // 5. Build swap calldata with slippage bounds
+        // 5. Get on-chain quote and build swap calldata with slippage bounds
+        let expected_output = match get_on_chain_quote(
+            &session.chain,
+            router_address,
+            sell_amount,
+            &route,
+            pool_type,
+        )
+        .await
+        {
+            Ok(quoted) => {
+                info!(
+                    session_id = %session.session_id,
+                    block_number = event.block_number,
+                    sell_amount = %sell_amount,
+                    quoted_output = %quoted,
+                    pool = %event.pool_address,
+                    "On-chain quote received"
+                );
+                quoted
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session.session_id,
+                    block_number = event.block_number,
+                    pool = %event.pool_address,
+                    error = %e,
+                    "On-chain quote failed, skipping trade"
+                );
+                continue;
+            }
+        };
+
         let slippage_bps = session_slippage_bps(session);
         let calldata = match build_swap_calldata(
             router_address,
             sell_amount,
+            expected_output,
             &route,
             pool_type,
             pool_cfg.fee_tier,
             recipient,
             &session.chain,
             slippage_bps,
-            &state.price_cache,
         ) {
             Ok(tx) => tx,
             Err(e) => {
                 warn!(
                     session_id = %session.session_id,
+                    block_number = event.block_number,
                     pool = %event.pool_address,
                     error = %e,
                     "Skipping trade: failed to build router calldata"
@@ -537,6 +645,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             Err(e) => {
                 error!(
                     session_id = %session.session_id,
+                    block_number = event.block_number,
                     pool = %event.pool_address,
                     error = %e,
                     "Failed to build, sign, or submit transaction"
@@ -547,8 +656,11 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
 
         info!(
             session_id = %session.session_id,
-            tx_hash = ?sell_tx_hash,
-            "Transaction submitted on-chain"
+            block_number = event.block_number,
+            buy_tx = %event.tx_hash,
+            sell_tx = ?sell_tx_hash,
+            sell_amount = %sell_amount,
+            "Trade pair: buy_tx → sell_tx"
         );
 
         // 7. Record trade in DB
@@ -565,6 +677,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
         if !recorded_trade.inserted {
             info!(
                 session_id = %session.session_id,
+                block_number = event.block_number,
                 trade_id = %recorded_trade.trade_id,
                 trigger_tx = %event.tx_hash,
                 trigger_log_index = event.log_index,
@@ -585,6 +698,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             Err(e) => {
                 error!(
                     session_id = %session.session_id,
+                    block_number = event.block_number,
                     trade_id = %recorded_trade.trade_id,
                     error = %e,
                     "Failed to finalize trade status from receipt"
@@ -623,6 +737,176 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                 serde_json::to_vec(&trade_event)?.into(),
             )
             .await;
+
+        // 9. Check if session is now fully sold → auto-complete and sweep funds
+        if recorded_trade.inserted {
+            let new_sold = sold + sell_amount; // sold was read earlier
+            if new_sold >= total {
+                info!(
+                    session_id = %session.session_id,
+                    "Session fully sold — marking completed and sweeping funds to investor wallet"
+                );
+
+                // Mark session completed
+                let session_id_uuid: uuid::Uuid = session.session_id.parse().unwrap_or_default();
+                let _ = sqlx::query(
+                    "UPDATE sessions SET status = 'completed', updated_at = NOW() WHERE id = $1",
+                )
+                .bind(session_id_uuid)
+                .execute(&state.db)
+                .await;
+
+                // Sweep converted funds to investor wallet
+                let investor_addr = {
+                    let cfg = liquifier_config::Settings::global();
+                    cfg.execution.investor_wallet.clone()
+                };
+
+                if investor_addr.is_empty() {
+                    warn!(
+                        session_id = %session.session_id,
+                        "investor_wallet not configured — skipping fund sweep"
+                    );
+                } else if let Err(e) =
+                    sweep_to_investor(&state.kms_client, &state.db, session, &investor_addr).await
+                {
+                    error!(
+                        session_id = %session.session_id,
+                        error = %e,
+                        "Failed to sweep funds to investor wallet"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// Post-completion fund sweep
+// ─────────────────────────────────────────────────────────────
+
+/// Transfer the session wallet's target-token balance to the configured investor wallet.
+async fn sweep_to_investor(
+    kms_client: &WalletKmsClient<Channel>,
+    db: &PgPool,
+    session: &SessionInfo,
+    investor_addr_str: &str,
+) -> Result<()> {
+    let investor: Address = investor_addr_str
+        .parse()
+        .with_context(|| format!("Invalid investor wallet address: {investor_addr_str}"))?;
+
+    let sender = resolve_session_wallet_address(db, &session.wallet_id, &session.chain).await?;
+
+    let settings = liquifier_config::Settings::global();
+    let chain_cfg = liquifier_config::get_chain(&settings.chains, &session.chain)
+        .with_context(|| format!("Missing chain config for {}", session.chain))?;
+    let chain_id = chain_cfg.chain_id;
+
+    let is_native_target = is_native_placeholder_address(&session.target_token);
+
+    if is_native_target {
+        // Query native balance via RPC
+        let rpc_url = chain_rpc_url(&session.chain)?;
+        let rpc_url: alloy::transports::http::reqwest::Url = rpc_url.parse()?;
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+        let balance = provider
+            .get_balance(sender)
+            .await
+            .context("Failed to fetch native balance")?;
+
+        if balance.is_zero() {
+            info!(session_id = %session.session_id, "No native balance to sweep");
+            return Ok(());
+        }
+
+        // Reserve gas for the transfer itself (~21000 gas)
+        let gas_price: u128 = provider
+            .get_gas_price()
+            .await
+            .context("Failed to fetch gas price for sweep")?;
+        let gas_cost = U256::from(21_000u64) * U256::from(gas_price.saturating_mul(2));
+
+        let send_amount = balance.saturating_sub(gas_cost);
+        if send_amount.is_zero() {
+            warn!(
+                session_id = %session.session_id,
+                balance = %balance,
+                gas_cost = %gas_cost,
+                "Native balance too low to cover gas for sweep"
+            );
+            return Ok(());
+        }
+
+        let tx_hash = build_sign_and_submit_tx(
+            kms_client,
+            &session.chain,
+            chain_id,
+            &session.wallet_id,
+            sender,
+            investor,
+            Vec::new(), // no calldata for native transfer
+            send_amount,
+        )
+        .await?;
+
+        info!(
+            session_id = %session.session_id,
+            tx_hash = %tx_hash,
+            amount = %send_amount,
+            "Native funds swept to investor wallet"
+        );
+    } else {
+        // ERC-20 target token — query balance then transfer
+        let rpc_url = chain_rpc_url(&session.chain)?;
+        let rpc_url: alloy::transports::http::reqwest::Url = rpc_url.parse()?;
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+        let token_address: Address = session
+            .target_token
+            .parse()
+            .with_context(|| format!("Invalid target token address: {}", session.target_token))?;
+
+        let erc20 = IERC20Approve::new(token_address, &provider);
+        let balance = erc20
+            .balanceOf(sender)
+            .call()
+            .await
+            .context("Failed to fetch target token balance")?;
+
+        if balance.is_zero() {
+            info!(session_id = %session.session_id, "No target token balance to sweep");
+            return Ok(());
+        }
+
+        // Build ERC-20 transfer calldata
+        let transfer_call = IERC20Approve::transferCall {
+            to: investor,
+            amount: balance,
+        };
+        let calldata = transfer_call.abi_encode();
+
+        let tx_hash = build_sign_and_submit_tx(
+            kms_client,
+            &session.chain,
+            chain_id,
+            &session.wallet_id,
+            sender,
+            token_address,
+            calldata,
+            U256::ZERO,
+        )
+        .await?;
+
+        info!(
+            session_id = %session.session_id,
+            tx_hash = %tx_hash,
+            token = %session.target_token_symbol,
+            amount = %balance,
+            "ERC-20 funds swept to investor wallet"
+        );
     }
 
     Ok(())
@@ -632,17 +916,58 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
+/// Get expected output amount from on-chain router quote.
+/// For V2, calls `getAmountsOut` on the router.
+/// For V3, we fall back to using the sell amount as a rough estimate (TODO: add V3 quoter).
+async fn get_on_chain_quote(
+    chain: &str,
+    router_address: Address,
+    amount: U256,
+    route: &PoolSwapRoute,
+    pool_type: PoolType,
+) -> Result<U256> {
+    let rpc_url = chain_rpc_url(chain)?;
+    let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
+        .parse()
+        .with_context(|| format!("Invalid RPC URL for chain {chain}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+    let (path, _, _) = resolve_route_tokens_for_native(route, chain)?;
+
+    match pool_type {
+        PoolType::V2 => {
+            let router = IUniswapV2Router::new(router_address, provider);
+            let amounts = router
+                .getAmountsOut(amount, path.clone())
+                .call()
+                .await
+                .context("getAmountsOut call failed")?;
+            // Last element is the final output amount
+            amounts
+                .last()
+                .copied()
+                .filter(|a| !a.is_zero())
+                .context("getAmountsOut returned zero or empty")
+        }
+        PoolType::V3 => {
+            // V3 quoter not implemented yet — return zero to signal caller should
+            // fall back to a conservative estimate.
+            Ok(U256::ZERO)
+        }
+    }
+}
+
 /// Build swap calldata for a router swap target with slippage protection.
 fn build_swap_calldata(
     _router_address: Address,
     amount: U256,
+    expected_output: U256,
     route: &PoolSwapRoute,
     pool_type: PoolType,
     default_fee_tier: u32,
     recipient: Address,
     chain: &str,
     slippage_bps: u32,
-    _price_cache: &PriceCache,
 ) -> Result<Vec<u8>> {
     let (path, native_input, native_output) = resolve_route_tokens_for_native(route, chain)?;
     let deadline = U256::from(
@@ -653,19 +978,19 @@ fn build_swap_calldata(
             .saturating_add(300),
     );
 
-    // Compute amountOutMin from slippage policy.
-    // We use a conservative estimate: for constant-product AMMs the expected
-    // output ≈ amount (1:1 approximation since we don't have a quote here).
-    // The slippage bound ensures we never accept zero output.
-    // A proper quote-based min output should be computed when quote data is
-    // available; for now, the slippage bound protects against sandwich attacks.
+    // Compute amountOutMin by applying slippage to the on-chain quoted output.
+    // If no quote is available (expected_output == 0), fall back to a 1:1
+    // approximation using the sell amount (conservative for non-1:1 pools).
+    let base_amount = if expected_output.is_zero() {
+        amount
+    } else {
+        expected_output
+    };
     let amount_out_min = if slippage_bps >= 10_000 {
         anyhow::bail!("Slippage bps must be less than 10000 (100%)");
     } else {
-        // amount_out_min = amount * (10000 - slippage_bps) / 10000
-        // This is a floor estimate; for non-1:1 pools the actual expected
-        // output differs, but this guarantees a non-zero minimum.
-        (amount * U256::from(10_000u64 - slippage_bps as u64)) / U256::from(10_000u64)
+        // amount_out_min = base_amount * (10000 - slippage_bps) / 10000
+        (base_amount * U256::from(10_000u64 - slippage_bps as u64)) / U256::from(10_000u64)
     };
 
     if amount_out_min.is_zero() {
@@ -1166,24 +1491,52 @@ async fn build_sign_and_submit_tx(
         .nonce(nonce)
         .with_chain_id(chain_id);
 
+    // Log a full curl command for debug_traceCall so the tx can be replayed offline
+    {
+        let data_hex = hex::encode(&calldata);
+        let value_hex = format!("{:#x}", value);
+        let rpc = chain_rpc_url(chain).unwrap_or_default();
+        let curl = format!(
+            r#"curl -s -X POST {rpc} -H 'Content-Type: application/json' -d '{{"jsonrpc":"2.0","id":1,"method":"debug_traceCall","params":[{{"from":"{sender:?}","to":"{to:?}","value":"{value_hex}","data":"0x{data_hex}","gas":"0x1312D00"}},"latest",{{"tracer":"callTracer"}}]}}'"#,
+        );
+        info!(
+            %sender,
+            %to,
+            %value,
+            nonce,
+            chain,
+            data_len = calldata.len(),
+            "\n=== DEBUG TRACE CURL ===\n{curl}\n========================"
+        );
+    }
+
     let gas_estimate = provider
         .estimate_gas(tx_for_estimate)
         .await
         .context("Gas estimation failed")?;
 
-    // Fetch fee data for EIP-1559
-    let fee_estimate = provider
-        .get_fee_history(1, alloy::eips::BlockNumberOrTag::Latest, &[])
+    // Fetch current gas price (legacy for BSC-like chains, EIP-1559 otherwise)
+    let gas_price: u128 = provider
+        .get_gas_price()
         .await
-        .context("Failed to fetch fee history")?;
+        .context("Failed to fetch gas price")?;
 
-    let base_fee: u128 = fee_estimate
-        .latest_block_base_fee()
-        .unwrap_or(1_000_000_000);
-    let max_priority_fee: u128 = 1_500_000_000; // 1.5 Gwei default tip
-    let max_fee: u128 = base_fee.saturating_mul(2).saturating_add(max_priority_fee);
+    let gas_limit = gas_estimate.saturating_mul(120) / 100; // 20% buffer
 
-    // Build the final unsigned transaction
+    info!(
+        %sender,
+        %to,
+        nonce,
+        chain,
+        gas_estimate,
+        gas_limit,
+        gas_price,
+        tx_cost_wei = gas_limit as u128 * gas_price,
+        "Gas parameters"
+    );
+
+    // Build the final unsigned transaction using legacy gas pricing
+    // (BSC and many L2s don't support EIP-1559)
     let unsigned_tx = TransactionRequest::default()
         .from(sender)
         .to(to)
@@ -1193,9 +1546,8 @@ async fn build_sign_and_submit_tx(
         )))
         .nonce(nonce)
         .with_chain_id(chain_id)
-        .gas_limit(gas_estimate.saturating_mul(120) / 100) // 20% buffer
-        .max_fee_per_gas(max_fee)
-        .max_priority_fee_per_gas(max_priority_fee);
+        .gas_limit(gas_limit)
+        .gas_price(gas_price);
 
     // Encode the unsigned transaction for KMS signing
     let unsigned_bytes =
@@ -1222,10 +1574,20 @@ async fn build_sign_and_submit_tx(
     }
 
     // Submit the signed transaction on-chain
-    let pending = provider
-        .send_raw_transaction(&signed_tx_bytes)
-        .await
-        .context("Failed to submit transaction to RPC")?;
+    let pending = match provider.send_raw_transaction(&signed_tx_bytes).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!(
+                %sender,
+                %to,
+                nonce,
+                chain,
+                rpc_error = %e,
+                "send_raw_transaction failed"
+            );
+            anyhow::bail!("Failed to submit transaction to RPC: {e}");
+        }
+    };
 
     let submitted_hash = format!("{:?}", pending.tx_hash());
     info!(tx_hash = %submitted_hash, "Transaction submitted on-chain");
@@ -1355,47 +1717,86 @@ fn session_slippage_bps(session: &SessionInfo) -> u32 {
     }
 }
 
-/// Estimate the USD value of a token amount using the oracle price cache.
+fn pool_type_to_oracle_version(pool_type: PoolType) -> u8 {
+    match pool_type {
+        PoolType::V2 => 2,
+        PoolType::V3 => 3,
+    }
+}
+
+/// Convert oracle outputs into a floating-point USD amount.
 ///
-/// `token_address` is the token whose USD value we want.
-/// `decimals` is the token's ERC-20 decimal count.
-/// `other_token` is the counterpart in the pool (used to derive price if
-/// `token_address` is not itself a base token).
-fn estimate_token_usd_value(
-    price_cache: &PriceCache,
-    chain: &str,
-    token_address: &str,
+/// The oracle returns a per-token USD price scaled by 1e36.
+fn usd_value_from_oracle_price_36(
     amount_raw: U256,
-    decimals: u32,
-    other_token: &str,
+    token_decimals: u32,
+    usd_price_36: U256,
 ) -> Option<f64> {
-    if amount_raw.is_zero() {
+    if amount_raw.is_zero() || usd_price_36.is_zero() {
         return Some(0.0);
     }
 
-    // Convert raw amount to a floating-point token amount
-    let divisor = 10_f64.powi(decimals as i32);
-    let amount_f64 = amount_raw.to_string().parse::<f64>().ok()? / divisor;
+    let amount_raw_f64 = amount_raw.to_string().parse::<f64>().ok()?;
+    let usd_price_36_f64 = usd_price_36.to_string().parse::<f64>().ok()?;
 
-    // Try direct base-token price
-    if let Some(price) = price_cache.get_base_token_price(chain, token_address) {
-        return Some(amount_f64 * price);
+    let amount_tokens = amount_raw_f64 / 10_f64.powi(token_decimals as i32);
+    let usd_per_token = usd_price_36_f64 / 1e36_f64;
+    let usd_value = amount_tokens * usd_per_token;
+    if usd_value.is_finite() {
+        Some(usd_value)
+    } else {
+        None
+    }
+}
+
+async fn fetch_buy_amount_usd_from_oracle(
+    chain: &str,
+    oracle_address: Address,
+    token_address: &str,
+    pair_address: &str,
+    version: u8,
+    amount_raw: U256,
+    token_decimals: u32,
+) -> Result<Option<f64>> {
+    if amount_raw.is_zero() {
+        return Ok(Some(0.0));
     }
 
-    // If the other token has a known price, use a 1:1 approximation
-    // (conservative — in production, a real quote should be fetched)
-    if let Some(other_price) = price_cache.get_base_token_price(chain, other_token) {
-        return Some(amount_f64 * other_price);
-    }
+    let rpc_url = chain_rpc_url(chain)?;
+    let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
+        .parse()
+        .with_context(|| format!("Invalid RPC URL for chain {chain}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
 
-    None
+    let token: Address = token_address
+        .parse()
+        .with_context(|| format!("Invalid trigger token address: {token_address}"))?;
+    let pair: Address = pair_address
+        .parse()
+        .with_context(|| format!("Invalid pair address: {pair_address}"))?;
+
+    let oracle = IPriceGetterV3::new(oracle_address, &provider);
+    let quote = oracle
+        .getUsdPrice(token, pair, version)
+        .call()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed getUsdPrice(token={token_address}, pair={pair_address}, version={version})"
+            )
+        })?;
+
+    Ok(usd_value_from_oracle_price_36(
+        amount_raw,
+        token_decimals,
+        quote,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::Address;
-    use common::pricing::PriceCache;
 
     // ── route_fee_tiers ─────────────────────────────────────
     #[test]
@@ -1725,52 +2126,40 @@ mod tests {
         assert!(parse_numeric_decimal("", "x").is_err());
     }
 
-    // ── estimate_token_usd_value ────────────────────────────
+    // ── oracle trigger valuation helpers ────────────────────
     #[test]
-    fn test_estimate_zero_amount() {
-        let cache = PriceCache::new();
-        let result = estimate_token_usd_value(&cache, "bsc", "0xtoken", U256::ZERO, 18, "0xother");
+    fn test_pool_type_to_oracle_version() {
+        assert_eq!(pool_type_to_oracle_version(PoolType::V2), 2);
+        assert_eq!(pool_type_to_oracle_version(PoolType::V3), 3);
+    }
+
+    #[test]
+    fn test_oracle_usd_value_zero_amount() {
+        let price_36 = U256::from(10u64).pow(U256::from(36u64));
+        let result = usd_value_from_oracle_price_36(U256::ZERO, 18, price_36);
         assert_eq!(result, Some(0.0));
     }
 
     #[test]
-    fn test_estimate_direct_base_token_price() {
-        let cache = PriceCache::new();
-        cache.set_price("bsc", "0xtoken", 2000.0); // token is $2000
+    fn test_oracle_usd_value_18_decimals() {
+        // 1 token amount at 18 decimals
+        let amount = U256::from(10u64).pow(U256::from(18u64));
+        // $2000 scaled by 1e36
+        let price_36 = U256::from(2000u64) * U256::from(10u64).pow(U256::from(36u64));
 
-        // 1e18 raw = 1.0 token at 18 decimals
-        let amount = U256::from(10u64).pow(U256::from(18));
-        let result = estimate_token_usd_value(&cache, "bsc", "0xtoken", amount, 18, "0xother");
-        assert!((result.unwrap() - 2000.0).abs() < 0.01);
+        let result = usd_value_from_oracle_price_36(amount, 18, price_36).unwrap();
+        assert!((result - 2000.0).abs() < 0.01);
     }
 
     #[test]
-    fn test_estimate_fallback_to_other_token() {
-        let cache = PriceCache::new();
-        cache.set_price("bsc", "0xother", 300.0); // only other token has price
-
-        let amount = U256::from(10u64).pow(U256::from(18));
-        let result = estimate_token_usd_value(&cache, "bsc", "0xtoken", amount, 18, "0xother");
-        assert!((result.unwrap() - 300.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_estimate_no_price_available() {
-        let cache = PriceCache::new();
-        let amount = U256::from(10u64).pow(U256::from(18));
-        let result = estimate_token_usd_value(&cache, "bsc", "0xtoken", amount, 18, "0xother");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_estimate_different_decimals() {
-        let cache = PriceCache::new();
-        cache.set_price("bsc", "0xusdt", 1.0);
-
-        // 1,000,000 raw = 1.0 USDT (6 decimals)
+    fn test_oracle_usd_value_6_decimals() {
+        // 1.0 token amount at 6 decimals
         let amount = U256::from(1_000_000u64);
-        let result = estimate_token_usd_value(&cache, "bsc", "0xusdt", amount, 6, "0xother");
-        assert!((result.unwrap() - 1.0).abs() < 0.001);
+        // $1 scaled by 1e36
+        let price_36 = U256::from(10u64).pow(U256::from(36u64));
+
+        let result = usd_value_from_oracle_price_36(amount, 6, price_36).unwrap();
+        assert!((result - 1.0).abs() < 0.001);
     }
 
     // ── parse_route_token_addresses ─────────────────────────

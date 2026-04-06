@@ -36,6 +36,8 @@ pub struct Settings {
     #[serde(default)]
     pub websocket: WebsocketSettings,
     #[serde(default)]
+    pub indexer: IndexerSettings,
+    #[serde(default)]
     pub execution: ExecutionSettings,
     #[serde(default)]
     pub pricing: PricingSettings,
@@ -127,6 +129,10 @@ pub struct AuthSettings {
     pub access_token_expiry_secs: u64,
     #[serde(default = "default_refresh_expiry")]
     pub refresh_token_expiry_secs: u64,
+    #[serde(default)]
+    pub admin_email: String,
+    #[serde(default)]
+    pub admin_password: String,
 }
 impl Default for AuthSettings {
     fn default() -> Self {
@@ -134,6 +140,8 @@ impl Default for AuthSettings {
             jwt_secret: String::new(),
             access_token_expiry_secs: default_access_expiry(),
             refresh_token_expiry_secs: default_refresh_expiry(),
+            admin_email: String::new(),
+            admin_password: String::new(),
         }
     }
 }
@@ -239,19 +247,66 @@ fn default_ws_grpc_addr() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct IndexerSettings {
+    #[serde(default = "default_indexer_worker_count")]
+    pub worker_count: usize,
+    #[serde(default = "default_indexer_block_queue_size")]
+    pub block_queue_size: usize,
+    #[serde(default = "default_indexer_block_poll_interval_ms")]
+    pub block_poll_interval_ms: u64,
+    #[serde(default = "default_indexer_max_block_age_secs")]
+    pub max_block_age_secs: u64,
+}
+impl Default for IndexerSettings {
+    fn default() -> Self {
+        Self {
+            worker_count: default_indexer_worker_count(),
+            block_queue_size: default_indexer_block_queue_size(),
+            block_poll_interval_ms: default_indexer_block_poll_interval_ms(),
+            max_block_age_secs: default_indexer_max_block_age_secs(),
+        }
+    }
+}
+fn default_indexer_worker_count() -> usize {
+    8
+}
+fn default_indexer_block_queue_size() -> usize {
+    1024
+}
+fn default_indexer_block_poll_interval_ms() -> u64 {
+    750
+}
+fn default_indexer_max_block_age_secs() -> u64 {
+    20
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSettings {
     #[serde(default = "default_max_impact")]
     pub max_price_impact_bps: u32,
+    /// Investor wallet address to receive converted funds after session completion.
+    /// Configurable via APP__EXECUTION__INVESTOR_WALLET.
+    #[serde(default)]
+    pub investor_wallet: String,
+    /// Price oracle used for buy-trigger USD threshold checks.
+    /// Configurable via APP__EXECUTION__BUY_TRIGGER_ORACLE_ADDRESS.
+    #[serde(default = "default_buy_trigger_oracle_address")]
+    pub buy_trigger_oracle_address: String,
 }
 impl Default for ExecutionSettings {
     fn default() -> Self {
         Self {
             max_price_impact_bps: default_max_impact(),
+            investor_wallet: String::new(),
+            buy_trigger_oracle_address: default_buy_trigger_oracle_address(),
         }
     }
 }
 fn default_max_impact() -> u32 {
     500
+}
+fn default_buy_trigger_oracle_address() -> String {
+    "0x06fd4EBfd011574F6915DE69991e3CfdD3dfC30f".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -612,9 +667,22 @@ mod tests {
     }
 
     #[test]
+    fn test_default_indexer_settings() {
+        let s = IndexerSettings::default();
+        assert_eq!(s.worker_count, 8);
+        assert_eq!(s.block_queue_size, 1024);
+        assert_eq!(s.block_poll_interval_ms, 750);
+        assert_eq!(s.max_block_age_secs, 20);
+    }
+
+    #[test]
     fn test_default_execution_settings() {
         let s = ExecutionSettings::default();
         assert_eq!(s.max_price_impact_bps, 500);
+        assert_eq!(
+            s.buy_trigger_oracle_address,
+            "0x06fd4EBfd011574F6915DE69991e3CfdD3dfC30f"
+        );
     }
 
     #[test]

@@ -55,7 +55,7 @@ function VerifyEmailContent() {
               <div className="text-4xl">✓</div>
               <p className="text-primary">{message}</p>
               <p className="text-sm text-muted-foreground">
-                Next, you&apos;ll need to set up 2FA to secure your account.
+                You can now sign in to your account.
               </p>
               <Link href="/login">
                 <Button>Continue to Sign In</Button>

@@ -9,6 +9,10 @@ import type {
   TotpSetupResponse,
   UserProfile,
   Wallet,
+  RefundRequest,
+  AdminRefundRequest,
+  AdminUser,
+  WalletSession,
 } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
@@ -103,14 +107,22 @@ class ApiClient {
 
   // ── Auth ───────────────────────────────────────────────────
 
-  async signup(email: string, password: string): Promise<SignupResponse> {
+  async signup(
+    email: string,
+    password: string,
+    role: string = "common",
+    username?: string,
+  ): Promise<SignupResponse> {
     const data = await this.request<SignupResponse>("/api/v1/auth/signup", {
       method: "POST",
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, role, username }),
     });
     if (data.access_token) {
       this.accessToken = data.access_token;
       localStorage.setItem("access_token", data.access_token);
+    }
+    if (data.role) {
+      localStorage.setItem("user_role", data.role);
     }
     return data;
   }
@@ -131,6 +143,9 @@ class ApiClient {
     if (data.refresh_token) {
       this.refreshToken = data.refresh_token;
       localStorage.setItem("refresh_token", data.refresh_token);
+    }
+    if (data.role) {
+      localStorage.setItem("user_role", data.role);
     }
     return data;
   }
@@ -341,6 +356,93 @@ class ApiClient {
       ? `?token_address=${encodeURIComponent(tokenAddress)}`
       : "";
     return this.request(`/api/v1/wallets/${walletId}/balance${params}`);
+  }
+
+  // ── Refund Requests ────────────────────────────────────────
+
+  async createRefundRequest(params: {
+    wallet_id: string;
+    amount: string;
+    token_address: string;
+    token_symbol: string;
+  }): Promise<{ refund_id: string; status: string; message: string }> {
+    return this.request("/api/v1/refunds", {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
+
+  async listMyRefundRequests(): Promise<{ refunds: RefundRequest[] }> {
+    return this.request("/api/v1/refunds");
+  }
+
+  // ── Common User: My Wallet Sessions ────────────────────────
+
+  async listMyWalletSessions(): Promise<{ sessions: WalletSession[] }> {
+    return this.request("/api/v1/my/sessions");
+  }
+
+  // ── Admin Routes ───────────────────────────────────────────
+
+  async adminListUsers(): Promise<{ users: AdminUser[] }> {
+    return this.request("/api/v1/admin/users");
+  }
+
+  async adminGetUserWallets(userId: string): Promise<{ wallets: Wallet[] }> {
+    return this.request(`/api/v1/admin/users/${userId}/wallets`);
+  }
+
+  async adminGetUserSessions(
+    userId: string,
+  ): Promise<{ sessions: import("./types").AdminUserSession[] }> {
+    return this.request(`/api/v1/admin/users/${userId}/sessions`);
+  }
+
+  async adminExportUserWallet(
+    userId: string,
+    walletId: string,
+    totpCode: string,
+  ): Promise<{ private_key: string; address: string }> {
+    return this.request(
+      `/api/v1/admin/users/${userId}/wallets/${walletId}/export`,
+      {
+        method: "POST",
+        body: JSON.stringify({ totp_code: totpCode }),
+      },
+    );
+  }
+
+  async adminListRefundRequests(): Promise<{
+    refunds: AdminRefundRequest[];
+  }> {
+    return this.request("/api/v1/admin/refunds");
+  }
+
+  async adminUpdateRefundStatus(
+    refundId: string,
+    status: string,
+    adminNote?: string,
+  ): Promise<{ refund_id: string; status: string }> {
+    return this.request(`/api/v1/admin/refunds/${refundId}`, {
+      method: "PUT",
+      body: JSON.stringify({ status, admin_note: adminNote }),
+    });
+  }
+
+  async adminUpdateUserRole(
+    userId: string,
+    role: "admin" | "common",
+  ): Promise<{ user_id: string; role: string }> {
+    return this.request(`/api/v1/admin/users/${userId}/role`, {
+      method: "PUT",
+      body: JSON.stringify({ role }),
+    });
+  }
+
+  async adminListAllWallets(): Promise<{
+    wallets: import("./types").AdminWallet[];
+  }> {
+    return this.request("/api/v1/admin/wallets");
   }
 }
 

@@ -31,3 +31,5 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
 lettre = { workspace = true }
+async-nats = { workspace = true }
+futures = { workspace = true }

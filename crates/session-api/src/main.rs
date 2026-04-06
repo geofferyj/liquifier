@@ -14,8 +14,10 @@ use rand::RngExt;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::time::Instant;
+use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::info;
 use uuid::Uuid;
@@ -26,14 +28,30 @@ mod pools;
 // Service State
 // ─────────────────────────────────────────────────────────────
 
+/// Cache key: (chain, pool_address, sell_token, target_token) — all lowercased.
+type PoolPathCacheKey = (String, String, String, String);
+
+struct CachedPath {
+    path: Option<SwapPath>,
+    inserted_at: Instant,
+}
+
+/// How long a cached pool-path entry stays valid.
+const POOL_PATH_CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
 pub struct SessionServiceImpl {
     db: PgPool,
     rpc_url: String,
+    pool_path_cache: RwLock<HashMap<PoolPathCacheKey, CachedPath>>,
 }
 
 impl SessionServiceImpl {
     pub fn new(db: PgPool, rpc_url: String) -> Self {
-        Self { db, rpc_url }
+        Self {
+            db,
+            rpc_url,
+            pool_path_cache: RwLock::new(HashMap::new()),
+        }
     }
 }
 
@@ -201,29 +219,48 @@ impl SessionService for SessionServiceImpl {
         &self,
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<ListSessionsResponse>, Status> {
-        let user_id: Uuid = request
-            .into_inner()
-            .user_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("Invalid user_id"))?;
+        let user_id_str = request.into_inner().user_id;
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, user_id, wallet_id, chain::text, status::text,
-                   sell_token, sell_token_symbol, sell_token_decimals,
-                   target_token, target_token_symbol, target_token_decimals,
-                   strategy::text, total_amount::text, amount_sold::text,
-                   pov_percent, max_price_impact, min_buy_trigger_usd,
-                   swap_path, public_slug, public_sharing_enabled, created_at, updated_at
-            FROM sessions
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| Status::internal(format!("DB error: {e}")))?;
+        let rows = if user_id_str.is_empty() {
+            // Empty user_id = list all sessions (admin use-case)
+            sqlx::query(
+                r#"
+                SELECT id, user_id, wallet_id, chain::text, status::text,
+                       sell_token, sell_token_symbol, sell_token_decimals,
+                       target_token, target_token_symbol, target_token_decimals,
+                       strategy::text, total_amount::text, amount_sold::text,
+                       pov_percent, max_price_impact, min_buy_trigger_usd,
+                       swap_path, public_slug, public_sharing_enabled, created_at, updated_at
+                FROM sessions
+                ORDER BY created_at DESC
+                "#,
+            )
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| Status::internal(format!("DB error: {e}")))?
+        } else {
+            let user_id: Uuid = user_id_str
+                .parse()
+                .map_err(|_| Status::invalid_argument("Invalid user_id"))?;
+
+            sqlx::query(
+                r#"
+                SELECT id, user_id, wallet_id, chain::text, status::text,
+                       sell_token, sell_token_symbol, sell_token_decimals,
+                       target_token, target_token_symbol, target_token_decimals,
+                       strategy::text, total_amount::text, amount_sold::text,
+                       pov_percent, max_price_impact, min_buy_trigger_usd,
+                       swap_path, public_slug, public_sharing_enabled, created_at, updated_at
+                FROM sessions
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                "#,
+            )
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| Status::internal(format!("DB error: {e}")))?
+        };
 
         let mut sessions: Vec<SessionInfo> = rows.iter().map(row_to_session_info).collect();
         for session in &mut sessions {
@@ -345,6 +382,25 @@ impl SessionService for SessionServiceImpl {
             ));
         }
 
+        // ── Check cache ──
+        let cache_key: PoolPathCacheKey = (
+            req.chain.to_lowercase(),
+            req.pool_address.to_lowercase(),
+            sell_token.to_lowercase(),
+            target_token.to_lowercase(),
+        );
+
+        {
+            let cache = self.pool_path_cache.read().await;
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.inserted_at.elapsed().as_secs() < POOL_PATH_CACHE_TTL_SECS {
+                    return Ok(Response::new(ComputePoolPathResponse {
+                        path: entry.path.clone(),
+                    }));
+                }
+            }
+        }
+
         let rpc_url: alloy::transports::http::reqwest::Url = self
             .rpc_url
             .parse()
@@ -369,6 +425,18 @@ impl SessionService for SessionServiceImpl {
             path.rank = 1;
             path
         });
+
+        // ── Store in cache ──
+        {
+            let mut cache = self.pool_path_cache.write().await;
+            cache.insert(
+                cache_key,
+                CachedPath {
+                    path: path.clone(),
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
 
         Ok(Response::new(ComputePoolPathResponse { path }))
     }

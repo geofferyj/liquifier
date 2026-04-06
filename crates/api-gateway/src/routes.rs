@@ -29,6 +29,14 @@ use crate::{auth, jwt_middleware::AuthUser, SharedState};
 pub struct SignupRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default = "default_role")]
+    pub role: String,
+}
+
+fn default_role() -> String {
+    "common".to_string()
 }
 
 #[derive(Deserialize)]
@@ -227,21 +235,36 @@ pub async fn signup(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let role = match body.role.as_str() {
+        "common" => "common",
+        _ => "common", // Only common users can sign up via the API
+    };
+
+    // Common users must provide a username
+    if role == "common" {
+        match &body.username {
+            Some(u) if u.len() >= 3 && u.len() <= 50 => {}
+            _ => return Err(StatusCode::BAD_REQUEST),
+        }
+    }
+
     let password_hash =
         auth::hash_password(&body.password).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check if user already exists with unverified email
-    let existing =
-        sqlx::query("SELECT id, email_verified, totp_enabled FROM users WHERE email = $1")
-            .bind(&body.email)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing = sqlx::query(
+        "SELECT id, email_verified, totp_enabled, role::text as role FROM users WHERE email = $1",
+    )
+    .bind(&body.email)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(row) = existing {
         let user_id: Uuid = row.get("id");
         let email_verified: bool = row.get("email_verified");
         let totp_enabled: bool = row.get("totp_enabled");
+        let existing_role: String = row.get("role");
 
         if !email_verified {
             // Re-generate verification token for existing unverified user
@@ -268,17 +291,19 @@ pub async fn signup(
             return Ok(Json(serde_json::json!({
                 "status": "email_verification_required",
                 "user_id": user_id.to_string(),
+                "role": existing_role,
                 "message": "Please check your email to verify your account."
             })));
         }
 
-        if email_verified && !totp_enabled {
+        if existing_role == "admin" && email_verified && !totp_enabled {
             // Issue temporary token so they can set up TOTP
             let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             return Ok(Json(serde_json::json!({
                 "status": "totp_setup_required",
                 "user_id": user_id.to_string(),
+                "role": "admin",
                 "access_token": access_token,
                 "message": "Email verified. Please set up 2FA to continue."
             })));
@@ -293,13 +318,15 @@ pub async fn signup(
     let expires = chrono::Utc::now() + chrono::Duration::hours(24);
 
     sqlx::query(
-        "INSERT INTO users (id, email, password_hash, verification_token, verification_token_expires_at) VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO users (id, email, password_hash, verification_token, verification_token_expires_at, role, username) VALUES ($1, $2, $3, $4, $5, $6::user_role, $7)",
     )
     .bind(user_id)
     .bind(&body.email)
     .bind(&password_hash)
     .bind(&verification_token)
     .bind(expires)
+    .bind(role)
+    .bind(&body.username)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -310,7 +337,7 @@ pub async fn signup(
         }
     })?;
 
-    info!(user_id = %user_id, email = %body.email, token = %verification_token, "User signed up — verification token generated");
+    info!(user_id = %user_id, email = %body.email, role = %role, token = %verification_token, "User signed up — verification token generated");
 
     if let Some(ref email_sender) = state.email {
         email_sender
@@ -321,6 +348,7 @@ pub async fn signup(
     Ok(Json(serde_json::json!({
         "status": "email_verification_required",
         "user_id": user_id.to_string(),
+        "role": role,
         "message": "Account created. Please check your email to verify your account."
     })))
 }
@@ -330,7 +358,7 @@ pub async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let row = sqlx::query(
-        "SELECT id, password_hash, email_verified, totp_enabled, totp_secret FROM users WHERE email = $1",
+        "SELECT id, password_hash, email_verified, totp_enabled, totp_secret, role::text as role FROM users WHERE email = $1",
     )
     .bind(&body.email)
     .fetch_optional(&state.db)
@@ -342,6 +370,7 @@ pub async fn login(
     let password_hash: String = row.get("password_hash");
     let email_verified: bool = row.get("email_verified");
     let totp_enabled: bool = row.get("totp_enabled");
+    let role: String = row.get("role");
 
     let valid = auth::verify_password(&body.password, &password_hash)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -375,11 +404,30 @@ pub async fn login(
         return Ok(Json(serde_json::json!({
             "status": "email_verification_required",
             "user_id": user_id.to_string(),
+            "role": role,
             "message": "Please verify your email before signing in. A new verification link has been sent."
         })));
     }
 
-    // Step 2: TOTP must be set up
+    // Common users: no 2FA required — issue tokens directly after email verification
+    if role == "common" {
+        let access_token =
+            auth::create_access_token_with_role(&user_id, &state.jwt_secret, "common")
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let refresh_token =
+            auth::create_refresh_token_with_role(&user_id, &state.jwt_secret, "common")
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return Ok(Json(serde_json::json!({
+            "status": "authenticated",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user_id": user_id.to_string(),
+            "role": "common"
+        })));
+    }
+
+    // Admin users: Step 2: TOTP must be set up
     if !totp_enabled {
         // Issue a temporary access token so user can call /2fa/setup and /2fa/verify
         let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
@@ -388,6 +436,7 @@ pub async fn login(
         return Ok(Json(serde_json::json!({
             "status": "totp_setup_required",
             "user_id": user_id.to_string(),
+            "role": "admin",
             "access_token": access_token,
             "message": "Please set up 2FA to continue."
         })));
@@ -400,6 +449,7 @@ pub async fn login(
             return Ok(Json(serde_json::json!({
                 "status": "totp_required",
                 "user_id": user_id.to_string(),
+                "role": "admin",
                 "message": "Please enter your 2FA code."
             })));
         }
@@ -416,16 +466,17 @@ pub async fn login(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
+    let access_token = auth::create_access_token_with_role(&user_id, &state.jwt_secret, "admin")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let refresh_token = auth::create_refresh_token(&user_id, &state.jwt_secret)
+    let refresh_token = auth::create_refresh_token_with_role(&user_id, &state.jwt_secret, "admin")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
         "status": "authenticated",
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "user_id": user_id.to_string()
+        "user_id": user_id.to_string(),
+        "role": "admin"
     })))
 }
 
@@ -446,6 +497,8 @@ pub async fn refresh_token(
         .parse()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
+    let role = token_data.claims.role.clone();
+
     // Verify user still exists
     let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
         .bind(user_id)
@@ -457,9 +510,9 @@ pub async fn refresh_token(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let access_token = auth::create_access_token(&user_id, &state.jwt_secret)
+    let access_token = auth::create_access_token_with_role(&user_id, &state.jwt_secret, &role)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let refresh_token = auth::create_refresh_token(&user_id, &state.jwt_secret)
+    let refresh_token = auth::create_refresh_token_with_role(&user_id, &state.jwt_secret, &role)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(AuthResponse {
@@ -778,7 +831,20 @@ pub async fn create_session(
 
     let resp = client
         .create_session(CreateSessionRequest {
-            user_id: user.user_id.to_string(),
+            user_id: if user.role == "admin" {
+                // Admin creating session on another user's wallet: look up wallet owner
+                let owner_row = sqlx::query_scalar::<_, String>(
+                    "SELECT user_id::text FROM wallets WHERE id = $1::uuid",
+                )
+                .bind(&body.wallet_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+                owner_row
+            } else {
+                user.user_id.to_string()
+            },
             wallet_id: body.wallet_id,
             chain: chain.clone(),
             sell_token,
@@ -812,7 +878,11 @@ pub async fn list_sessions(
 
     let resp = client
         .list_sessions(ListSessionsRequest {
-            user_id: user.user_id.to_string(),
+            user_id: if user.role == "admin" {
+                String::new() // Admin sees all sessions
+            } else {
+                user.user_id.to_string()
+            },
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -1057,6 +1127,19 @@ pub async fn verify_email(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let token = params.get("token").ok_or(StatusCode::BAD_REQUEST)?;
 
+    // Get the user before verifying so we know their role
+    let user_row = sqlx::query(
+        "SELECT id, role::text as role FROM users WHERE verification_token = $1 AND verification_token_expires_at > NOW() AND email_verified = FALSE",
+    )
+    .bind(token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let user_id: Uuid = user_row.get("id");
+    let role: String = user_row.get("role");
+
     let result = sqlx::query(
         r#"
         UPDATE users SET email_verified = TRUE, verification_token = NULL, verification_token_expires_at = NULL
@@ -1072,7 +1155,20 @@ pub async fn verify_email(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    Ok(Json(serde_json::json!({ "verified": true })))
+    // Auto-create wallet for common users
+    if role == "common" {
+        if let Ok(mut client) = WalletKmsClient::connect(state.kms_addr.clone()).await {
+            let _ = client
+                .create_wallet(CreateWalletRequest {
+                    user_id: user_id.to_string(),
+                    chain: "bsc".to_string(),
+                })
+                .await;
+            info!(user_id = %user_id, "Auto-created wallet for common user");
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "verified": true, "role": role })))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1280,7 +1376,7 @@ pub async fn get_profile(
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let row = sqlx::query(
-        "SELECT email, totp_enabled, email_verified, created_at FROM users WHERE id = $1",
+        "SELECT email, username, totp_enabled, email_verified, role::text as role, created_at FROM users WHERE id = $1",
     )
     .bind(user.user_id)
     .fetch_one(&state.db)
@@ -1288,15 +1384,19 @@ pub async fn get_profile(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let email: String = row.get("email");
+    let username: Option<String> = row.get("username");
     let totp_enabled: bool = row.get("totp_enabled");
     let email_verified: bool = row.try_get("email_verified").unwrap_or(false);
+    let role: String = row.get("role");
     let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
 
     Ok(Json(serde_json::json!({
         "user_id": user.user_id.to_string(),
         "email": email,
+        "username": username,
         "totp_enabled": totp_enabled,
         "email_verified": email_verified,
+        "role": role,
         "created_at": created_at.to_rfc3339(),
     })))
 }
@@ -1532,4 +1632,544 @@ fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
         "updated_at": s.updated_at,
         "pools": pools,
     })
+}
+
+// ─────────────────────────────────────────────────────────────
+// Refund Requests
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CreateRefundRequest {
+    pub wallet_id: String,
+    pub amount: String,
+    pub token_address: String,
+    pub token_symbol: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRefundStatusBody {
+    pub status: String,
+    pub admin_note: Option<String>,
+}
+
+pub async fn create_refund_request(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Json(body): Json<CreateRefundRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Only common users can request refunds
+    if user.role != "common" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let wallet_id: Uuid = body
+        .wallet_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Verify wallet belongs to user
+    let wallet_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM wallets WHERE id = $1 AND user_id = $2)",
+    )
+    .bind(wallet_id)
+    .bind(user.user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !wallet_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO refund_requests (id, user_id, wallet_id, amount, token_address, token_symbol) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(user.user_id)
+    .bind(wallet_id)
+    .bind(&body.amount)
+    .bind(&body.token_address)
+    .bind(&body.token_symbol)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "refund_id": id.to_string(),
+        "status": "pending",
+        "message": "Refund request submitted."
+    })))
+}
+
+pub async fn list_my_refund_requests(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id::text, wallet_id::text, amount, token_address, token_symbol, status, admin_note, created_at, updated_at
+        FROM refund_requests WHERE user_id = $1 ORDER BY created_at DESC
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let refunds: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = r.get("updated_at");
+            serde_json::json!({
+                "refund_id": r.get::<String, _>("id"),
+                "wallet_id": r.get::<String, _>("wallet_id"),
+                "amount": r.get::<String, _>("amount"),
+                "token_address": r.get::<String, _>("token_address"),
+                "token_symbol": r.get::<String, _>("token_symbol"),
+                "status": r.get::<String, _>("status"),
+                "admin_note": r.get::<Option<String>, _>("admin_note"),
+                "created_at": created_at.to_rfc3339(),
+                "updated_at": updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "refunds": refunds })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin: User Management
+// ─────────────────────────────────────────────────────────────
+
+pub async fn admin_list_users(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT u.id::text, u.email, u.username, u.role::text as role, u.email_verified, u.totp_enabled, u.created_at,
+               COUNT(DISTINCT w.id) as wallet_count,
+               COUNT(DISTINCT s.id) as session_count
+        FROM users u
+        LEFT JOIN wallets w ON w.user_id = u.id
+        LEFT JOIN sessions s ON s.wallet_id = w.id
+        GROUP BY u.id
+        ORDER BY u.created_at DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let users: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            serde_json::json!({
+                "user_id": r.get::<String, _>("id"),
+                "email": r.get::<String, _>("email"),
+                "username": r.get::<Option<String>, _>("username"),
+                "role": r.get::<String, _>("role"),
+                "email_verified": r.get::<bool, _>("email_verified"),
+                "totp_enabled": r.get::<bool, _>("totp_enabled"),
+                "wallet_count": r.get::<i64, _>("wallet_count"),
+                "session_count": r.get::<i64, _>("session_count"),
+                "created_at": created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "users": users })))
+}
+
+pub async fn admin_get_user_wallets(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path(target_user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let target_id: Uuid = target_user_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let mut client = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let resp = client
+        .list_wallets(ListWalletsRequest {
+            user_id: target_id.to_string(),
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    Ok(Json(
+        serde_json::json!({ "wallets": resp.wallets.iter().map(|w| {
+        serde_json::json!({
+            "wallet_id": w.wallet_id,
+            "address": w.address,
+            "chain": w.chain,
+            "created_at": w.created_at,
+        })
+    }).collect::<Vec<_>>() }),
+    ))
+}
+
+pub async fn admin_export_user_wallet(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path((target_user_id, wallet_id)): Path<(String, String)>,
+    Json(body): Json<ExportWalletBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Admin must verify their own TOTP
+    let row = sqlx::query("SELECT totp_enabled, totp_secret FROM users WHERE id = $1")
+        .bind(user.user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let totp_enabled: bool = row.get("totp_enabled");
+    if !totp_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let totp_code = body.totp_code.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    let totp_secret: Vec<u8> = row.get("totp_secret");
+
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, totp_secret, None, String::new())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !totp
+        .check_current(totp_code)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let mut client = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let resp = client
+        .export_private_key(ExportPrivateKeyRequest {
+            wallet_id,
+            user_id: target_user_id,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    Ok(Json(serde_json::json!({
+        "private_key": resp.private_key,
+        "address": resp.address,
+    })))
+}
+
+pub async fn admin_list_refund_requests(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT r.id::text, r.user_id::text, r.wallet_id::text, r.amount, r.token_address,
+               r.token_symbol, r.status, r.admin_note, r.created_at, r.updated_at,
+               u.email, u.username
+        FROM refund_requests r
+        JOIN users u ON u.id = r.user_id
+        ORDER BY r.created_at DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let refunds: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = r.get("updated_at");
+            serde_json::json!({
+                "refund_id": r.get::<String, _>("id"),
+                "user_id": r.get::<String, _>("user_id"),
+                "wallet_id": r.get::<String, _>("wallet_id"),
+                "email": r.get::<String, _>("email"),
+                "username": r.get::<Option<String>, _>("username"),
+                "amount": r.get::<String, _>("amount"),
+                "token_address": r.get::<String, _>("token_address"),
+                "token_symbol": r.get::<String, _>("token_symbol"),
+                "status": r.get::<String, _>("status"),
+                "admin_note": r.get::<Option<String>, _>("admin_note"),
+                "created_at": created_at.to_rfc3339(),
+                "updated_at": updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "refunds": refunds })))
+}
+
+pub async fn admin_update_refund_status(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path(refund_id): Path<String>,
+    Json(body): Json<UpdateRefundStatusBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    match body.status.as_str() {
+        "approved" | "rejected" | "completed" => {}
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+
+    let id: Uuid = refund_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let result = sqlx::query(
+        "UPDATE refund_requests SET status = $1, admin_note = $2, updated_at = NOW() WHERE id = $3",
+    )
+    .bind(&body.status)
+    .bind(&body.admin_note)
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(serde_json::json!({
+        "refund_id": refund_id,
+        "status": body.status,
+    })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin: User Sessions
+// ─────────────────────────────────────────────────────────────
+
+pub async fn admin_get_user_sessions(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path(target_user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let target_id: Uuid = target_user_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT s.id::text AS session_id, s.status::text AS status,
+               s.sell_token_symbol, s.target_token_symbol, s.chain::text AS chain,
+               s.total_amount::text AS total_amount, s.amount_sold::text AS amount_sold,
+               s.pov_percent::float8 AS pov_percent, s.created_at, s.updated_at,
+               s.sell_token_decimals, s.target_token_decimals,
+               s.strategy, s.public_slug,
+               w.address AS wallet_address
+        FROM sessions s
+        JOIN wallets w ON s.wallet_id = w.id
+        WHERE w.user_id = $1
+        ORDER BY s.created_at DESC
+        "#,
+    )
+    .bind(target_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = r.get("updated_at");
+            serde_json::json!({
+                "session_id": r.get::<String, _>("session_id"),
+                "status": r.get::<String, _>("status"),
+                "sell_token_symbol": r.get::<String, _>("sell_token_symbol"),
+                "target_token_symbol": r.get::<String, _>("target_token_symbol"),
+                "sell_token_decimals": r.get::<i32, _>("sell_token_decimals"),
+                "target_token_decimals": r.get::<i32, _>("target_token_decimals"),
+                "chain": r.get::<String, _>("chain"),
+                "total_amount": r.get::<String, _>("total_amount"),
+                "amount_sold": r.get::<String, _>("amount_sold"),
+                "pov_percent": r.get::<f64, _>("pov_percent"),
+                "strategy": r.get::<String, _>("strategy"),
+                "wallet_address": r.get::<String, _>("wallet_address"),
+                "public_slug": r.get::<Option<String>, _>("public_slug"),
+                "created_at": created_at.to_rfc3339(),
+                "updated_at": updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Common User: Sessions on their wallets
+// ─────────────────────────────────────────────────────────────
+
+pub async fn list_my_wallet_sessions(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Find all sessions that use wallets owned by this user
+    let rows = sqlx::query(
+        r#"
+        SELECT s.id::text AS session_id, s.status::text AS status,
+               s.sell_token_symbol, s.target_token_symbol, s.chain::text AS chain,
+               s.total_amount::text AS total_amount, s.amount_sold::text AS amount_sold,
+               s.pov_percent::float8 AS pov_percent, s.created_at, s.public_slug,
+               w.address AS wallet_address
+        FROM sessions s
+        JOIN wallets w ON s.wallet_id = w.id
+        WHERE w.user_id = $1
+        ORDER BY s.created_at DESC
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            serde_json::json!({
+                "session_id": r.get::<String, _>("session_id"),
+                "status": r.get::<String, _>("status"),
+                "sell_token_symbol": r.get::<String, _>("sell_token_symbol"),
+                "target_token_symbol": r.get::<String, _>("target_token_symbol"),
+                "chain": r.get::<String, _>("chain"),
+                "total_amount": r.get::<String, _>("total_amount"),
+                "amount_sold": r.get::<String, _>("amount_sold"),
+                "pov_percent": r.get::<f64, _>("pov_percent"),
+                "wallet_address": r.get::<String, _>("wallet_address"),
+                "public_slug": r.get::<Option<String>, _>("public_slug"),
+                "created_at": created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin: Update User Role
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdateRoleRequest {
+    pub role: String,
+}
+
+pub async fn admin_update_user_role(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path(target_user_id): Path<String>,
+    Json(body): Json<UpdateRoleRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let new_role = match body.role.as_str() {
+        "admin" | "common" => body.role.as_str(),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let target_id: Uuid = target_user_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Prevent admin from changing their own role
+    if target_id == user.user_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Both upgrade and downgrade: reset TOTP.
+    // Upgrading to admin: totp_enabled = false triggers 2FA setup on next login.
+    // Downgrading to common: clears any stale TOTP data.
+    sqlx::query(
+        "UPDATE users SET role = $1::user_role, totp_enabled = false, totp_secret = NULL WHERE id = $2",
+    )
+    .bind(new_role)
+    .bind(target_id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    info!(admin = %user.user_id, target = %target_id, new_role = %new_role, "User role updated");
+
+    Ok(Json(serde_json::json!({
+        "user_id": target_user_id,
+        "role": new_role,
+    })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin: List All Wallets (with owner info)
+// ─────────────────────────────────────────────────────────────
+
+pub async fn admin_list_all_wallets(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT w.id::text AS wallet_id, w.address, w.chain::text AS chain, w.created_at,
+               u.id::text AS owner_id, COALESCE(u.username, u.email) AS owner_name
+        FROM wallets w
+        JOIN users u ON u.id = w.user_id
+        ORDER BY u.username, w.created_at DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let wallets: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            serde_json::json!({
+                "wallet_id": r.get::<String, _>("wallet_id"),
+                "address": r.get::<String, _>("address"),
+                "chain": r.get::<String, _>("chain"),
+                "created_at": created_at.to_rfc3339(),
+                "owner_id": r.get::<String, _>("owner_id"),
+                "owner_name": r.get::<String, _>("owner_name"),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "wallets": wallets })))
 }

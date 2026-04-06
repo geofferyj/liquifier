@@ -26,6 +26,8 @@ auth:
   jwt_secret: "dev-jwt-secret-change-in-production"
   access_token_expiry_secs: 3600      # 1 hour
   refresh_token_expiry_secs: 604800   # 7 days
+  admin_email: ""                      # Override via APP__AUTH__ADMIN_EMAIL
+  admin_password: ""                   # Override via APP__AUTH__ADMIN_PASSWORD
 
 # ─── KMS ──────────────────────────────────────────────────────
 kms:
@@ -59,9 +61,18 @@ websocket:
   grpc_port: 50053
   grpc_addr: "http://localhost:50053"
 
+# ─── Indexer ────────────────────────────────────────────────
+indexer:
+  worker_count: 3
+  block_queue_size: 1024
+  block_poll_interval_ms: 250
+  max_block_age_secs: 60
+
 # ─── Execution Engine ────────────────────────────────────────
 execution:
   max_price_impact_bps: 500  # global safety cap, 5%
+  investor_wallet: ""        # Override via APP__EXECUTION__INVESTOR_WALLET
+  buy_trigger_oracle_address: "0x06fd4EBfd011574F6915DE69991e3CfdD3dfC30f"  # Override via APP__EXECUTION__BUY_TRIGGER_ORACLE_ADDRESS
 
 # ─── Pricing ──────────────────────────────────────────────────
 pricing:

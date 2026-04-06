@@ -1,8 +1,9 @@
 "use client";
 
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAuthStore } from "@/lib/store";
 import {
   AreaChart,
   Area,
@@ -29,9 +30,15 @@ import {
 import type { Session, SessionStatus } from "@/lib/types";
 
 export default function SessionDashboardPage() {
+  const router = useRouter();
+  const role = useAuthStore((s) => s.role);
   const params = useParams<{ id: string }>();
   const sessionId = params.id;
   const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (role && role !== "admin") router.replace("/my-dashboard");
+  }, [role, router]);
 
   // Fetch session data
   const sessionQuery = useQuery({
@@ -94,6 +101,14 @@ export default function SessionDashboardPage() {
 
   const session = sessionQuery.data;
 
+  // Fetch the wallet's current target-token balance.
+  const targetBalanceQuery = useQuery({
+    queryKey: ["wallet-target-balance", session?.wallet_id, session?.target_token],
+    queryFn: () => api.getWalletBalance(session!.wallet_id, session!.target_token),
+    enabled: !!session?.wallet_id && !!session?.target_token,
+    refetchInterval: 30_000,
+  });
+
   useEffect(() => {
     if (!session || !sessionId || !sessionTradesQuery.data) {
       return;
@@ -146,6 +161,17 @@ export default function SessionDashboardPage() {
     (liveData?.recentTrades.length ?? 0) > 0
       ? liveData?.recentTrades ?? []
       : sessionTradesQuery.data ?? [];
+
+  // Sum all received_amount values from trades to get total target-token received.
+  const totalReceived = recentTrades.reduce((acc, t) => {
+    try {
+      return acc + BigInt(t.received_amount ?? "0");
+    } catch {
+      return acc;
+    }
+  }, 0n);
+
+  const walletTargetBalance = targetBalanceQuery.data?.balance ?? "0";
 
   // Build chart data from recent trades
   const chartData = recentTrades
@@ -260,7 +286,7 @@ export default function SessionDashboardPage() {
       </div>
 
       {/* Metric Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
@@ -312,12 +338,28 @@ export default function SessionDashboardPage() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
-              Converted Value
+              Total Received
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold font-mono text-green-500">
+              {formatTokenAmount(totalReceived.toString(), session.target_token_decimals)}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {session.target_token_symbol}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-muted-foreground">
+              Wallet Balance
             </CardTitle>
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold font-mono text-primary">
-              ${convertedUsd}
+              {formatTokenAmount(walletTargetBalance, session.target_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.target_token_symbol}
