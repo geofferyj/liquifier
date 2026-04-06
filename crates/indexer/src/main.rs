@@ -328,22 +328,22 @@ async fn process_block<P: Provider<Ethereum> + Clone>(
     let block_age_secs = now_secs.saturating_sub(block_timestamp);
 
     if block_age_secs > max_block_age_secs {
-        info!(
-            chain = %chain_name,
-            block_number,
-            block_age_secs,
-            max_block_age_secs,
-            "Dropped block number: too old"
-        );
+        // info!(
+        //     chain = %chain_name,
+        //     block_number,
+        //     block_age_secs,
+        //     max_block_age_secs,
+        //     "Dropped block number: too old"
+        // );
         return Ok(());
     }
 
-    info!(
-        chain = %chain_name,
-        block_number,
-        block_age_secs,
-        "Valid block number: processing"
-    );
+    // info!(
+    //     chain = %chain_name,
+    //     block_number,
+    //     block_age_secs,
+    //     "Valid block number: processing"
+    // );
 
     let receipts = provider
         .get_block_receipts(BlockId::Number(BlockNumberOrTag::Number(block_number)))

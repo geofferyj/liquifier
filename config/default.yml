@@ -63,10 +63,10 @@ websocket:
 
 # ─── Indexer ────────────────────────────────────────────────
 indexer:
-  worker_count: 3
-  block_queue_size: 1024
-  block_poll_interval_ms: 250
-  max_block_age_secs: 60
+  worker_count: 12
+  block_queue_size: 4096
+  block_poll_interval_ms: 100
+  max_block_age_secs: 20
 
 # ─── Execution Engine ────────────────────────────────────────
 execution:
