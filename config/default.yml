@@ -54,12 +54,14 @@ smtp:
 # ─── API Gateway ──────────────────────────────────────────────
 api_gateway:
   http_port: 8080
+  cors_allowed_origin: "http://localhost:3001"
 
 # ─── WebSocket Service ────────────────────────────────────────
 websocket:
   http_port: 8081
   grpc_port: 50053
   grpc_addr: "http://localhost:50053"
+  cors_allowed_origin: "http://localhost:3001"
 
 # ─── Indexer ────────────────────────────────────────────────
 indexer:

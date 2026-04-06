@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use axum::{
+    http::HeaderValue,
     middleware,
     routing::{get, post, put},
     Router,
@@ -12,7 +13,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -92,10 +93,7 @@ async fn main() -> Result<()> {
         email: email_sender,
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors_layer(&cfg.api_gateway.cors_allowed_origin)?;
 
     // Public routes (no auth required)
     let public_routes = Router::new()
@@ -235,6 +233,19 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn build_cors_layer(allowed_origin: &str) -> Result<CorsLayer> {
+    let origin = allowed_origin.trim();
+    let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+
+    if origin == "*" {
+        return Ok(base.allow_origin(Any));
+    }
+
+    let origin_header = HeaderValue::from_str(origin)
+        .context("api_gateway.cors_allowed_origin must be a valid origin header value")?;
+    Ok(base.allow_origin(AllowOrigin::exact(origin_header)))
 }
 
 // ─────────────────────────────────────────────────────────────

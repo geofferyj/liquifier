@@ -4,6 +4,7 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
+    http::HeaderValue,
     response::IntoResponse,
     routing::get,
     Router,
@@ -21,7 +22,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use tonic::{transport::Server as GrpcServer, Request, Response, Status};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{error, info};
 
 // ─────────────────────────────────────────────────────────────
@@ -324,10 +325,7 @@ async fn main() -> Result<()> {
         db,
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors_layer(&cfg.websocket.cors_allowed_origin)?;
 
     let app = Router::new()
         .route("/ws/session/{session_id}", get(ws_session_handler))
@@ -362,4 +360,17 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn build_cors_layer(allowed_origin: &str) -> Result<CorsLayer> {
+    let origin = allowed_origin.trim();
+    let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+
+    if origin == "*" {
+        return Ok(base.allow_origin(Any));
+    }
+
+    let origin_header = HeaderValue::from_str(origin)
+        .context("websocket.cors_allowed_origin must be a valid origin header value")?;
+    Ok(base.allow_origin(AllowOrigin::exact(origin_header)))
 }

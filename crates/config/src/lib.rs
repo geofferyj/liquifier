@@ -206,16 +206,22 @@ fn default_session_grpc_addr() -> String {
 pub struct ApiGatewaySettings {
     #[serde(default = "default_api_port")]
     pub http_port: u16,
+    #[serde(default = "default_api_cors_allowed_origin")]
+    pub cors_allowed_origin: String,
 }
 impl Default for ApiGatewaySettings {
     fn default() -> Self {
         Self {
             http_port: default_api_port(),
+            cors_allowed_origin: default_api_cors_allowed_origin(),
         }
     }
 }
 fn default_api_port() -> u16 {
     8080
+}
+fn default_api_cors_allowed_origin() -> String {
+    "http://localhost:3001".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,6 +232,8 @@ pub struct WebsocketSettings {
     pub grpc_port: u16,
     #[serde(default = "default_ws_grpc_addr")]
     pub grpc_addr: String,
+    #[serde(default = "default_ws_cors_allowed_origin")]
+    pub cors_allowed_origin: String,
 }
 impl Default for WebsocketSettings {
     fn default() -> Self {
@@ -233,6 +241,7 @@ impl Default for WebsocketSettings {
             http_port: default_ws_http_port(),
             grpc_port: default_ws_grpc_port(),
             grpc_addr: default_ws_grpc_addr(),
+            cors_allowed_origin: default_ws_cors_allowed_origin(),
         }
     }
 }
@@ -244,6 +253,9 @@ fn default_ws_grpc_port() -> u16 {
 }
 fn default_ws_grpc_addr() -> String {
     "http://localhost:50053".into()
+}
+fn default_ws_cors_allowed_origin() -> String {
+    "http://localhost:3001".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -657,6 +669,7 @@ mod tests {
     fn test_default_api_gateway_settings() {
         let s = ApiGatewaySettings::default();
         assert_eq!(s.http_port, 8080);
+        assert_eq!(s.cors_allowed_origin, "http://localhost:3001");
     }
 
     #[test]
@@ -664,6 +677,7 @@ mod tests {
         let s = WebsocketSettings::default();
         assert_eq!(s.http_port, 8081);
         assert_eq!(s.grpc_port, 50053);
+        assert_eq!(s.cors_allowed_origin, "http://localhost:3001");
     }
 
     #[test]

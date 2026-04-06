@@ -4,3 +4,9 @@ application:
 
 database:
   max_connections: 25
+
+api_gateway:
+  cors_allowed_origin: "https://app.example.com"
+
+websocket:
+  cors_allowed_origin: "https://app.example.com"
