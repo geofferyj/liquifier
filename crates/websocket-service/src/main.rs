@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
-    http::HeaderValue,
+    http::{HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -24,6 +24,7 @@ use tokio::sync::{broadcast, RwLock};
 use tonic::{transport::Server as GrpcServer, Request, Response, Status};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{error, info};
+use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────
 // Shared State
@@ -109,6 +110,12 @@ struct WsQuery {
     token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
+    sub: String,
+    token_type: String,
+}
+
 /// Authenticated WebSocket: /ws/session/{session_id}?token=JWT
 async fn ws_session_handler(
     ws: WebSocketUpgrade,
@@ -116,21 +123,59 @@ async fn ws_session_handler(
     Query(query): Query<WsQuery>,
     State(state): State<SharedWsState>,
 ) -> impl IntoResponse {
-    // Validate JWT
-    let token = query.token.unwrap_or_default();
-    let valid = jsonwebtoken::decode::<serde_json::Value>(
-        &token,
+    let token = match query.token.as_deref() {
+        Some(token) if !token.is_empty() => token,
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let token_data = match jsonwebtoken::decode::<JwtClaims>(
+        token,
         &jsonwebtoken::DecodingKey::from_secret(state.jwt_secret.as_bytes()),
         &jsonwebtoken::Validation::default(),
-    )
-    .is_ok();
+    ) {
+        Ok(data) => data,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
 
-    if !valid {
-        return axum::http::Response::builder()
-            .status(401)
-            .body(axum::body::Body::empty())
-            .unwrap()
-            .into_response();
+    if token_data.claims.token_type != "access" {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let user_id = match token_data.claims.sub.parse::<Uuid>() {
+        Ok(user_id) => user_id,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let session_uuid = match session_id.parse::<Uuid>() {
+        Ok(session_uuid) => session_uuid,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let role = match sqlx::query_scalar::<_, String>("SELECT role::text FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(Some(role)) => role,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let allowed = match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1 AND ($2::boolean OR user_id = $3))",
+    )
+    .bind(session_uuid)
+    .bind(role == "admin")
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    if !allowed {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     ws.on_upgrade(move |socket| handle_ws(socket, session_id, state))
@@ -143,24 +188,23 @@ async fn ws_public_handler(
     Path(slug): Path<String>,
     State(state): State<SharedWsState>,
 ) -> impl IntoResponse {
-    // Look up the session by public_slug
-    let session_id: Option<String> =
-        sqlx::query_scalar("SELECT id::text FROM sessions WHERE public_slug = $1")
-            .bind(&slug)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten();
+    // Look up only actively shared sessions by public_slug.
+    let session_id: Option<String> = match sqlx::query_scalar(
+        "SELECT id::text FROM sessions WHERE public_slug = $1 AND public_sharing_enabled = TRUE",
+    )
+    .bind(&slug)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(session_id) => session_id,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     match session_id {
         Some(sid) => ws
             .on_upgrade(move |socket| handle_ws(socket, sid, state))
             .into_response(),
-        None => axum::http::Response::builder()
-            .status(404)
-            .body(axum::body::Body::empty())
-            .unwrap()
-            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -366,8 +410,14 @@ fn build_cors_layer(allowed_origin: &str) -> Result<CorsLayer> {
     let origin = allowed_origin.trim();
     let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
 
+    if origin.is_empty() {
+        bail!("websocket.cors_allowed_origin cannot be empty");
+    }
+
     if origin == "*" {
-        return Ok(base.allow_origin(Any));
+        bail!(
+            "websocket.cors_allowed_origin must be a trusted origin, wildcard '*' is not allowed"
+        );
     }
 
     let origin_header = HeaderValue::from_str(origin)

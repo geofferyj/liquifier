@@ -318,7 +318,7 @@ pub async fn signup(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            info!(user_id = %user_id, token = %token, "Re-sent verification token for existing unverified user");
+            info!(user_id = %user_id, "Re-sent verification email for existing unverified user");
 
             if let Some(ref email_sender) = state.email {
                 email_sender
@@ -375,7 +375,7 @@ pub async fn signup(
         }
     })?;
 
-    info!(user_id = %user_id, email = %body.email, role = %role, token = %verification_token, "User signed up — verification token generated");
+    info!(user_id = %user_id, email = %body.email, role = %role, "User signed up — verification email generated");
 
     if let Some(ref email_sender) = state.email {
         email_sender
@@ -431,7 +431,7 @@ pub async fn login(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        info!(user_id = %user_id, token = %token, "Login attempt with unverified email — re-sent verification token");
+        info!(user_id = %user_id, "Login attempt with unverified email — re-sent verification email");
 
         if let Some(ref email_sender) = state.email {
             email_sender
@@ -535,16 +535,19 @@ pub async fn refresh_token(
         .parse()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let role = token_data.claims.role.clone();
-
-    // Verify user still exists
-    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+    // Always derive role from DB so role changes take effect immediately on refresh.
+    let role = sqlx::query_scalar::<_, String>("SELECT role::text FROM users WHERE id = $1")
         .bind(user_id)
-        .fetch_one(&state.db)
+        .fetch_optional(&state.db)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if !exists {
+    let role = match role {
+        Some(role) => role,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    if role != "admin" && role != "common" {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -930,11 +933,39 @@ pub async fn list_sessions(
     Ok(Json(serde_json::json!({ "sessions": sessions })))
 }
 
+async fn ensure_session_access(
+    state: &SharedState,
+    user: &AuthUser,
+    session_id: &str,
+) -> Result<(), StatusCode> {
+    let session_uuid = session_id
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let allowed = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1 AND ($2::boolean OR user_id = $3))",
+    )
+    .bind(session_uuid)
+    .bind(user.role == "admin")
+    .bind(user.user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !allowed {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(())
+}
+
 pub async fn get_session(
     State(state): State<SharedState>,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    ensure_session_access(&state, &user, &session_id).await?;
+
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -956,7 +987,7 @@ pub async fn get_session(
 
 pub async fn update_session_status(
     State(state): State<SharedState>,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
     Path(session_id): Path<String>,
     Json(body): Json<UpdateStatusBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -965,6 +996,8 @@ pub async fn update_session_status(
         "active" | "paused" | "cancelled" => {}
         _ => return Err(StatusCode::BAD_REQUEST),
     }
+
+    ensure_session_access(&state, &user, &session_id).await?;
 
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
@@ -976,7 +1009,13 @@ pub async fn update_session_status(
             status: body.status,
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            if e.code() == tonic::Code::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?
         .into_inner();
 
     Ok(Json(session_info_to_json(&resp)))
@@ -1145,7 +1184,7 @@ pub async fn resend_verification(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Send verification email (falls back to log-only if SMTP not configured)
-    info!(user_id = %user.user_id, token = %token, "Email verification token generated");
+    info!(user_id = %user.user_id, "Email verification email generated");
 
     if let Some(ref email_sender) = state.email {
         let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
@@ -1215,10 +1254,12 @@ pub async fn verify_email(
 
 pub async fn update_session_config(
     State(state): State<SharedState>,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
     Path(session_id): Path<String>,
     Json(body): Json<UpdateSessionConfigBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    ensure_session_access(&state, &user, &session_id).await?;
+
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -1231,7 +1272,13 @@ pub async fn update_session_config(
             min_buy_trigger_usd: body.min_buy_trigger_usd,
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            if e.code() == tonic::Code::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?
         .into_inner();
 
     Ok(Json(session_info_to_json(&resp)))
@@ -1243,10 +1290,12 @@ pub async fn update_session_config(
 
 pub async fn toggle_public_sharing(
     State(state): State<SharedState>,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
     Path(session_id): Path<String>,
     Json(body): Json<ToggleSharingBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    ensure_session_access(&state, &user, &session_id).await?;
+
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -1257,7 +1306,13 @@ pub async fn toggle_public_sharing(
             enabled: body.enabled,
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            if e.code() == tonic::Code::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?
         .into_inner();
 
     Ok(Json(session_info_to_json(&resp)))

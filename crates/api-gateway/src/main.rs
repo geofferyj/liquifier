@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     http::HeaderValue,
     middleware,
@@ -239,8 +239,14 @@ fn build_cors_layer(allowed_origin: &str) -> Result<CorsLayer> {
     let origin = allowed_origin.trim();
     let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
 
+    if origin.is_empty() {
+        bail!("api_gateway.cors_allowed_origin cannot be empty");
+    }
+
     if origin == "*" {
-        return Ok(base.allow_origin(Any));
+        bail!(
+            "api_gateway.cors_allowed_origin must be a trusted origin, wildcard '*' is not allowed"
+        );
     }
 
     let origin_header = HeaderValue::from_str(origin)
