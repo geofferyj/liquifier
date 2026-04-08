@@ -31,13 +31,17 @@ export default function Home() {
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-8 p-8">
       <div className="text-center">
-        <h1 className="text-5xl font-bold tracking-tight text-primary">
-          Liquifier
+        <h1 className="text-5xl font-bold tracking-tight text-primary inline-flex flex-col items-end">
+          <span>Liquifier Bot</span>
+          <span className="text-xs font-normal text-muted-foreground tracking-widest">
+            by penitools
+          </span>
         </h1>
-        <p className="mt-4 text-lg text-muted-foreground max-w-lg">
-          Systematically offload large token positions on EVM DEXes without
-          causing market price impact. POV-based execution with real-time
-          monitoring.
+        <p className="mt-4 text-xl font-semibold max-w-lg">
+          Offload large amounts of tokens without triggering price drops.
+        </p>
+        <p className="mt-4 text-base text-muted-foreground max-w-lg">
+          Our liquifier bot helps you sell your position intelligently in a way that minimizes slippage and price impact on any token.
         </p>
       </div>
       <div className="flex gap-4">

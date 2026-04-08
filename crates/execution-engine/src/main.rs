@@ -691,6 +691,8 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             &session.chain,
             &recorded_trade.trade_id,
             sell_tx_hash.as_deref(),
+            &session.target_token,
+            recipient,
         )
         .await
         {
@@ -708,6 +710,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                 TradeFinalization {
                     status: "failed".to_string(),
                     failure_reason: Some(failure_reason),
+                    received_amount: None,
                 }
             }
         };
@@ -717,13 +720,19 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             .clone()
             .unwrap_or_else(|| event.tx_hash.clone());
 
+        // Use actual received amount from receipt parsing; fall back to "0" if unknown
+        let received_amount = finalization
+            .received_amount
+            .clone()
+            .unwrap_or_else(|| "0".to_string());
+
         let trade_event = serde_json::json!({
             "type": "trade_completed",
             "trade_id": recorded_trade.trade_id,
             "session_id": session.session_id,
             "chain": session.chain,
             "sell_amount": sell_amount.to_string(),
-            "received_amount": event.amount_out,
+            "received_amount": received_amount,
             "tx_hash": tx_hash,
             "price_impact_bps": price_impact_bps,
             "executed_at": recorded_trade.executed_at,
@@ -1229,6 +1238,7 @@ struct RecordedTrade {
 struct TradeFinalization {
     status: String,
     failure_reason: Option<String>,
+    received_amount: Option<String>,
 }
 
 async fn record_trade(
@@ -1324,33 +1334,43 @@ async fn finalize_trade_status_from_receipt(
     chain: &str,
     trade_id: &str,
     sell_tx_hash: Option<&str>,
+    target_token: &str,
+    recipient: Address,
 ) -> Result<TradeFinalization> {
     let Some(tx_hash) = sell_tx_hash.map(str::trim).filter(|h| !h.is_empty()) else {
         return Ok(TradeFinalization {
             status: "submitted".to_string(),
             failure_reason: None,
+            received_amount: None,
         });
     };
 
-    match fetch_receipt_success(chain, tx_hash).await {
-        Ok(Some(true)) => {
+    match fetch_receipt_with_received(chain, tx_hash, target_token, recipient).await {
+        Ok(Some((true, received))) => {
             mark_trade_confirmed(db, trade_id).await?;
+            // Store actual received amount in final_received / final_token
+            if let Some(ref amount) = received {
+                update_trade_received(db, trade_id, amount, target_token).await?;
+            }
             Ok(TradeFinalization {
                 status: "confirmed".to_string(),
                 failure_reason: None,
+                received_amount: received,
             })
         }
-        Ok(Some(false)) => {
+        Ok(Some((false, _))) => {
             let reason = "transaction_reverted".to_string();
             mark_trade_failed(db, trade_id, &reason).await?;
             Ok(TradeFinalization {
                 status: "failed".to_string(),
                 failure_reason: Some(reason),
+                received_amount: None,
             })
         }
         Ok(None) => Ok(TradeFinalization {
             status: "submitted".to_string(),
             failure_reason: None,
+            received_amount: None,
         }),
         Err(e) => {
             let reason = format!("receipt_lookup_error: {e}");
@@ -1358,6 +1378,7 @@ async fn finalize_trade_status_from_receipt(
             Ok(TradeFinalization {
                 status: "failed".to_string(),
                 failure_reason: Some(reason),
+                received_amount: None,
             })
         }
     }
@@ -1399,7 +1420,14 @@ async fn mark_trade_failed(db: &PgPool, trade_id: &str, reason: &str) -> Result<
     Ok(())
 }
 
-async fn fetch_receipt_success(chain: &str, tx_hash: &str) -> Result<Option<bool>> {
+/// Fetch receipt, check success, and extract the actual received amount
+/// by parsing ERC-20 Transfer event logs where `to` = recipient.
+async fn fetch_receipt_with_received(
+    chain: &str,
+    tx_hash: &str,
+    target_token: &str,
+    recipient: Address,
+) -> Result<Option<(bool, Option<String>)>> {
     let rpc_url = chain_rpc_url(chain)?;
     let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
         .parse()
@@ -1418,8 +1446,170 @@ async fn fetch_receipt_success(chain: &str, tx_hash: &str) -> Result<Option<bool
         return Ok(None);
     };
 
-    let receipt_json = serde_json::to_value(receipt).context("Failed to serialize receipt")?;
-    Ok(parse_receipt_success_from_json(&receipt_json))
+    let receipt_json = serde_json::to_value(&receipt).context("Failed to serialize receipt")?;
+    let Some(success) = parse_receipt_success_from_json(&receipt_json) else {
+        return Ok(None);
+    };
+
+    if !success {
+        return Ok(Some((false, None)));
+    }
+
+    // Parse ERC-20 Transfer(from, to, amount) events from receipt logs.
+    // Transfer topic0 = keccak256("Transfer(address,address,uint256)")
+    let transfer_topic: B256 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        .parse()
+        .unwrap();
+
+    let is_native_target = is_native_placeholder_address(target_token);
+
+    let received = if is_native_target {
+        // For native-out swaps, look for WETH/WBNB Withdrawal event to the router,
+        // or simply fall back to None (will use trigger_buy_amount fallback in queries).
+        // A more robust approach: check the wrapped native token's Withdrawal event.
+        let wrapped_native = configured_wrapped_native_token_for_chain(chain)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // Withdrawal(address indexed src, uint256 wad)
+        let withdrawal_topic: B256 =
+            "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
+                .parse()
+                .unwrap();
+
+        extract_received_from_logs(
+            &receipt_json,
+            &wrapped_native,
+            &withdrawal_topic,
+            None, // no `to` filter for Withdrawal events
+            true, // data-only amount (no indexed to)
+        )
+    } else {
+        let target_lower = target_token.to_ascii_lowercase();
+        extract_received_from_logs(
+            &receipt_json,
+            &target_lower,
+            &transfer_topic,
+            Some(recipient),
+            false,
+        )
+    };
+
+    Ok(Some((true, received.map(|a| a.to_string()))))
+}
+
+/// Parse receipt logs to extract received token amount.
+fn extract_received_from_logs(
+    receipt: &serde_json::Value,
+    token_address: &str,
+    event_topic: &B256,
+    recipient_filter: Option<Address>,
+    amount_in_data_only: bool,
+) -> Option<U256> {
+    let logs = receipt.get("logs")?.as_array()?;
+    let mut total = U256::ZERO;
+
+    for log in logs {
+        // Check contract address matches token
+        let log_address = log
+            .get("address")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if log_address != token_address {
+            continue;
+        }
+
+        // Check topic0 matches the event signature
+        let topics = log.get("topics").and_then(|t| t.as_array())?;
+        let topic0_str = topics.first().and_then(|t| t.as_str()).unwrap_or_default();
+        let topic0: B256 = match topic0_str.parse() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if topic0 != *event_topic {
+            continue;
+        }
+
+        if amount_in_data_only {
+            // Withdrawal(address indexed src, uint256 wad) — amount is in data
+            let data_hex = log.get("data").and_then(|d| d.as_str()).unwrap_or_default();
+            if let Some(amount) = parse_u256_from_hex(data_hex) {
+                total += amount;
+            }
+        } else {
+            // Transfer(address indexed from, address indexed to, uint256 amount)
+            // topics[1] = from, topics[2] = to, data = amount
+            if let Some(filter_addr) = recipient_filter {
+                let to_topic = topics.get(2).and_then(|t| t.as_str()).unwrap_or_default();
+                let to_addr = parse_address_from_topic(to_topic);
+                if to_addr != Some(filter_addr) {
+                    continue;
+                }
+            }
+
+            let data_hex = log.get("data").and_then(|d| d.as_str()).unwrap_or_default();
+            if let Some(amount) = parse_u256_from_hex(data_hex) {
+                total += amount;
+            }
+        }
+    }
+
+    if total.is_zero() {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+fn parse_u256_from_hex(hex_str: &str) -> Option<U256> {
+    let trimmed = hex_str
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if trimmed.is_empty() {
+        return None;
+    }
+    U256::from_str_radix(trimmed, 16).ok()
+}
+
+fn parse_address_from_topic(topic: &str) -> Option<Address> {
+    // Topics are 32-byte (64 hex) zero-padded; address is the last 20 bytes
+    let trimmed = topic
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if trimmed.len() < 40 {
+        return None;
+    }
+    let addr_hex = &trimmed[trimmed.len() - 40..];
+    format!("0x{addr_hex}").parse().ok()
+}
+
+async fn update_trade_received(
+    db: &PgPool,
+    trade_id: &str,
+    amount: &str,
+    token: &str,
+) -> Result<()> {
+    let trade_id: uuid::Uuid = trade_id
+        .parse()
+        .context("Invalid trade_id for received update")?;
+    let amount_decimal = parse_numeric_decimal(amount, "final_received")?;
+    sqlx::query(
+        r#"
+        UPDATE trades
+        SET final_received = $1,
+            final_token = $2
+        WHERE id = $3
+        "#,
+    )
+    .bind(amount_decimal)
+    .bind(token)
+    .bind(trade_id)
+    .execute(db)
+    .await
+    .context("Failed to update trade final_received")?;
+    Ok(())
 }
 
 fn parse_receipt_success_from_json(receipt: &serde_json::Value) -> Option<bool> {
