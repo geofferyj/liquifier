@@ -23,40 +23,12 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
   formatTokenAmount,
+  formatTokenAmountCompact,
   shortenAddress,
   shortenTxHash,
   cn,
 } from "@/lib/utils";
 import type { Session, SessionStatus } from "@/lib/types";
-
-function formatTokenAmountCompact(raw: string, decimals: number): string {
-  if (!raw || raw === "0") return "0";
-
-  try {
-    const amountRaw = BigInt(raw);
-    const divisor = 10n ** BigInt(decimals);
-    const units = [
-      { threshold: 1_000_000_000_000n, suffix: "T" },
-      { threshold: 1_000_000_000n, suffix: "B" },
-      { threshold: 1_000_000n, suffix: "M" },
-      { threshold: 1_000n, suffix: "K" },
-    ];
-
-    for (const unit of units) {
-      const unitDivisor = divisor * unit.threshold;
-      if (amountRaw >= unitDivisor) {
-        const scaledX100 = (amountRaw * 100n) / unitDivisor;
-        const intPart = scaledX100 / 100n;
-        const fracPart = scaledX100 % 100n;
-        return `${intPart.toString()}.${fracPart.toString().padStart(2, "0")}${unit.suffix}`;
-      }
-    }
-  } catch {
-    // Fallback to full formatting below.
-  }
-
-  return formatTokenAmount(raw, decimals);
-}
 
 function rawTokenAmountToNumber(raw: string, decimals: number): number {
   const parsed = Number.parseFloat(formatTokenAmount(raw, decimals));
@@ -86,14 +58,9 @@ function formatUsd(value: number | null): string {
 
 export default function SessionDashboardPage() {
   const router = useRouter();
-  const role = useAuthStore((s) => s.role);
   const params = useParams<{ id: string }>();
   const sessionId = params.id;
   const queryClient = useQueryClient();
-
-  useEffect(() => {
-    if (role && role !== "admin") router.replace("/my-dashboard");
-  }, [role, router]);
 
   // Fetch session data
   const sessionQuery = useQuery({
@@ -169,14 +136,6 @@ export default function SessionDashboardPage() {
     refetchInterval: 60_000,
   });
 
-  // Fetch the wallet's current target-token balance.
-  const targetBalanceQuery = useQuery({
-    queryKey: ["wallet-target-balance", session?.wallet_id, session?.target_token],
-    queryFn: () => api.getWalletBalance(session!.wallet_id, session!.target_token),
-    enabled: !!session?.wallet_id && !!session?.target_token,
-    refetchInterval: 30_000,
-  });
-
   useEffect(() => {
     if (!session || !sessionId || !sessionTradesQuery.data) {
       return;
@@ -230,10 +189,13 @@ export default function SessionDashboardPage() {
       ? liveData?.recentTrades ?? []
       : sessionTradesQuery.data?.trades ?? [];
 
-  const walletTargetBalance = targetBalanceQuery.data?.balance ?? "0";
-
   const sellTokenUsdPrice = sellTokenUsdPriceQuery.data?.usd_price;
   const targetTokenUsdPrice = targetTokenUsdPriceQuery.data?.usd_price;
+
+  // Total target tokens received across all trades
+  const convertedAmount = recentTrades
+    .reduce((sum, t) => sum + BigInt(t.received_amount), 0n)
+    .toString();
 
   const totalToSellUsd = calculateUsdValue(
     session.total_amount,
@@ -250,8 +212,8 @@ export default function SessionDashboardPage() {
     session.sell_token_decimals,
     sellTokenUsdPrice,
   );
-  const walletBalanceUsd = calculateUsdValue(
-    walletTargetBalance,
+  const convertedAmountUsd = calculateUsdValue(
+    convertedAmount,
     session.target_token_decimals,
     targetTokenUsdPrice,
   );
@@ -433,20 +395,20 @@ export default function SessionDashboardPage() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
-              Wallet Balance
+              Converted
             </CardTitle>
           </CardHeader>
           <CardContent>
             <p
               className="text-xl md:text-2xl font-bold font-mono text-primary leading-tight break-all"
-              title={formatTokenAmount(walletTargetBalance, session.target_token_decimals)}
+              title={formatTokenAmount(convertedAmount, session.target_token_decimals)}
             >
-              {formatTokenAmountCompact(walletTargetBalance, session.target_token_decimals)}
+              {formatTokenAmountCompact(convertedAmount, session.target_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">
               {session.target_token_symbol}
             </p>
-            <p className="text-xs text-muted-foreground">{formatUsd(walletBalanceUsd)}</p>
+            <p className="text-xs text-muted-foreground">{formatUsd(convertedAmountUsd)}</p>
           </CardContent>
         </Card>
       </div>

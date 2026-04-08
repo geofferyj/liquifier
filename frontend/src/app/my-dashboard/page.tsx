@@ -68,6 +68,7 @@ function MyDashboardContent() {
   });
 
   const [desiredUsd, setDesiredUsd] = useState("10000");
+  const [walletExpanded, setWalletExpanded] = useState(false);
 
   const [refundAmount, setRefundAmount] = useState("");
   const [refundError, setRefundError] = useState("");
@@ -114,6 +115,8 @@ function MyDashboardContent() {
   const refunds = refundsQuery.data?.refunds ?? [];
   const balance = balanceQuery.data;
 
+  const hasActiveSession = sessions.length > 0;
+
   return (
     <main className="min-h-screen p-8 max-w-3xl mx-auto">
       <div className="flex items-center justify-between mb-8">
@@ -132,10 +135,46 @@ function MyDashboardContent() {
 
       {/* ── Wallet Card with QR ─────────────────────────── */}
       <Card className="mb-8">
-        <CardHeader>
-          <CardTitle>My Wallet</CardTitle>
+        <CardHeader
+          className={cn(
+            hasActiveSession && "cursor-pointer select-none",
+          )}
+          onClick={() => hasActiveSession && setWalletExpanded((v) => !v)}
+        >
+          <div className="flex items-center justify-between">
+            <CardTitle className="flex items-center gap-2">
+              My Wallet
+              {hasActiveSession && wallet && (
+                <span className="text-sm font-normal text-muted-foreground">
+                  · {shortenAddress(wallet.address)}
+                  {balance
+                    ? ` · ${formatTokenAmount(balance.balance, balance.decimals)} WKC`
+                    : ""}
+                </span>
+              )}
+            </CardTitle>
+            {hasActiveSession && (
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className={cn(
+                  "transition-transform text-muted-foreground",
+                  walletExpanded && "rotate-180",
+                )}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            )}
+          </div>
         </CardHeader>
-        <CardContent>
+        {(!hasActiveSession || walletExpanded) && <CardContent>
           {!wallet ? (
             <p className="text-sm text-muted-foreground">
               Your wallet is being set up...
@@ -258,10 +297,8 @@ function MyDashboardContent() {
               </p>
             </div>
           )}
-        </CardContent>
+        </CardContent>}
       </Card>
-
-      {/* ── Sessions on my wallet ────────────────────────── */}
       <Card className="mb-8">
         <CardHeader>
           <CardTitle>Sessions Using My Wallet</CardTitle>
@@ -281,11 +318,14 @@ function MyDashboardContent() {
                           BigInt(session.total_amount),
                       ) / 100
                     : 0;
+                const remaining =
+                  BigInt(session.total_amount) - BigInt(session.amount_sold);
 
                 return (
                   <div
                     key={session.session_id}
-                    className="p-3 rounded-lg bg-muted/50 space-y-2"
+                    className="p-3 rounded-lg bg-muted/50 space-y-2 cursor-pointer hover:bg-muted/80 transition-colors"
+                    onClick={() => router.push(`/sessions/${session.session_id}`)}
                   >
                     <div className="flex items-center justify-between">
                       <div>
@@ -313,6 +353,20 @@ function MyDashboardContent() {
                       >
                         {session.status.toUpperCase()}
                       </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-xs">
+                      <div>
+                        <p className="text-muted-foreground">Total</p>
+                        <p className="font-medium">{formatTokenAmount(session.total_amount, session.sell_token_decimals)} {session.sell_token_symbol}</p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Sold</p>
+                        <p className="font-medium">{formatTokenAmount(session.amount_sold, session.sell_token_decimals)} {session.sell_token_symbol}</p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Remaining</p>
+                        <p className="font-medium">{formatTokenAmount(remaining.toString(), session.sell_token_decimals)} {session.sell_token_symbol}</p>
+                      </div>
                     </div>
                     <div className="flex items-center justify-between text-xs text-muted-foreground">
                       <span>Progress: {progress.toFixed(1)}%</span>

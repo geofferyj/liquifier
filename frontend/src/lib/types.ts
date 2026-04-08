@@ -234,6 +234,7 @@ export interface WalletSession {
   status: string;
   sell_token_symbol: string;
   target_token_symbol: string;
+  sell_token_decimals: number;
   chain: string;
   total_amount: string;
   amount_sold: string;

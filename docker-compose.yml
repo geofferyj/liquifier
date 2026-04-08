@@ -182,6 +182,7 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://liquifier.penitools.com}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-wss://liquifier.penitools.com}
+    env_file: .env
     ports:
       - "3001:3000"
     environment:

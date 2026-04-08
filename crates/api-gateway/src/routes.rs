@@ -1,6 +1,8 @@
 use alloy::{
+    network::TransactionBuilder,
     primitives::{Address, U256},
-    providers::ProviderBuilder,
+    providers::{Provider, ProviderBuilder},
+    rpc::types::TransactionRequest,
     sol,
 };
 use axum::{
@@ -12,7 +14,7 @@ use common::proto::{
     session_service_client::SessionServiceClient, wallet_kms_client::WalletKmsClient,
     ComputePoolPathRequest, CreateSessionRequest, CreateWalletRequest, DiscoverPoolsRequest,
     ExportPrivateKeyRequest, GetBalanceRequest, GetSessionBySlugRequest, GetSessionRequest,
-    GetSwapPathsRequest, ListSessionsRequest, ListWalletsRequest, PoolInfo,
+    GetSwapPathsRequest, ListSessionsRequest, ListWalletsRequest, PoolInfo, SignTransactionRequest,
     TogglePublicSharingRequest, UpdateSessionConfigRequest, UpdateSessionStatusRequest,
 };
 use common::types::{
@@ -999,6 +1001,14 @@ pub async fn update_session_status(
 
     ensure_session_access(&state, &user, &session_id).await?;
 
+    // When activating a session, fund the wallet with gas first
+    if body.status == "active" {
+        if let Err(e) = fund_session_wallet_gas(&state, &session_id).await {
+            // Log but don't block session start — gas may already be sufficient
+            warn!(session_id = %session_id, error = %e, "Gas funding attempt failed");
+        }
+    }
+
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -1019,6 +1029,221 @@ pub async fn update_session_status(
         .into_inner();
 
     Ok(Json(session_info_to_json(&resp)))
+}
+
+/// Estimate gas required for a session's swaps and transfer native tokens
+/// from the configured gas wallet to the session wallet if needed.
+async fn fund_session_wallet_gas(state: &SharedState, session_id: &str) -> Result<(), String> {
+    let cfg = liquifier_config::Settings::global();
+    let gas_wallet_id = cfg.execution.gas_wallet_id.trim();
+    if gas_wallet_id.is_empty() {
+        return Err("gas_wallet_id not configured".into());
+    }
+    let padding_pct = cfg.execution.gas_padding_percent;
+
+    // 1. Fetch session info via gRPC
+    let mut session_client = SessionServiceClient::connect(state.session_addr.clone())
+        .await
+        .map_err(|e| format!("Session gRPC connect: {e}"))?;
+
+    let session = session_client
+        .get_session(GetSessionRequest {
+            session_id: session_id.to_string(),
+        })
+        .await
+        .map_err(|e| format!("GetSession: {e}"))?
+        .into_inner();
+
+    let chain = &session.chain;
+    let chain_cfg = cfg
+        .chains
+        .get(chain)
+        .ok_or_else(|| format!("No chain config for {chain}"))?;
+    let rpc_url = chain_cfg.rpc_url.trim();
+    if rpc_url.is_empty() {
+        return Err(format!("RPC URL not configured for chain {chain}"));
+    }
+    let chain_id = chain_cfg.chain_id;
+
+    // 2. Resolve session wallet address
+    let wallet_address: String =
+        sqlx::query_scalar("SELECT address FROM wallets WHERE id = $1::uuid")
+            .bind(&session.wallet_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| format!("Resolve wallet address: {e}"))?;
+
+    let wallet_addr: Address = wallet_address
+        .parse()
+        .map_err(|e| format!("Parse wallet address: {e}"))?;
+
+    // 3. Connect to RPC and get current native balance
+    let rpc_url_parsed: alloy::transports::http::reqwest::Url =
+        rpc_url.parse().map_err(|e| format!("Parse RPC URL: {e}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url_parsed);
+
+    let current_balance = provider
+        .get_balance(wallet_addr)
+        .await
+        .map_err(|e| format!("Get native balance: {e}"))?;
+
+    // 4. Estimate gas per swap using a dummy V2 swap calldata for gas estimation
+    //    A PancakeSwap V2 swap with fee-on-transfer typically costs 200-300k gas.
+    //    We conservatively use 300k gas units per swap (includes approval overhead).
+    let gas_per_swap = U256::from(300_000u64);
+
+    let gas_price: u128 = provider
+        .get_gas_price()
+        .await
+        .map_err(|e| format!("Get gas price: {e}"))?;
+
+    let cost_per_swap = gas_per_swap * U256::from(gas_price);
+
+    // 5. Calculate number of potential swaps
+    //    Use min_buy_trigger_usd to estimate the minimum sell amount per swap.
+    //    If min_buy_trigger_usd is 0, use a reasonable default (~$50 worth).
+    //    The sell amount per swap = (min_buy_trigger_usd / token_price) * pov_percent / 100.
+    //    Since we don't have a reliable token price here, we use total_amount / reasonable_chunk.
+    //    A simpler approach: total_amount / min_swap_amount where min_swap_amount is derived
+    //    from total_amount / 1000 (assume up to 1000 swaps max) as conservative upper bound.
+    let total_amount = U256::from_str_radix(&session.total_amount, 10).unwrap_or(U256::ZERO);
+    let amount_sold = U256::from_str_radix(&session.amount_sold, 10).unwrap_or(U256::ZERO);
+    let remaining = total_amount.saturating_sub(amount_sold);
+
+    if remaining.is_zero() {
+        info!(session_id = %session_id, "Session fully sold, no gas funding needed");
+        return Ok(());
+    }
+
+    // Estimate: each swap sells roughly pov_percent of a market trade.
+    // Conservatively assume we'll need at most (remaining / (total * pov / 10000)) swaps,
+    // capped at 5000 to prevent absurd estimates.
+    let pov_bps = (session.pov_percent * 100.0) as u64;
+    let min_sell_per_swap = if pov_bps > 0 {
+        // Minimum sell per swap = total * pov / 10000 / 10 (assume 10x smaller market trades than total)
+        let chunk = (total_amount * U256::from(pov_bps)) / U256::from(100_000u64);
+        if chunk.is_zero() {
+            remaining / U256::from(1000u64)
+        } else {
+            chunk
+        }
+    } else {
+        remaining / U256::from(1000u64)
+    };
+
+    let num_swaps = if min_sell_per_swap.is_zero() {
+        U256::from(1000u64)
+    } else {
+        (remaining + min_sell_per_swap - U256::from(1u64)) / min_sell_per_swap // ceiling division
+    };
+    let num_swaps = num_swaps.min(U256::from(5000u64));
+
+    // 6. Total gas needed = cost_per_swap * num_swaps * (100 + padding) / 100
+    let total_gas_needed =
+        (cost_per_swap * num_swaps * U256::from(100u64 + padding_pct as u64)) / U256::from(100u64);
+
+    // 7. Calculate deficit
+    let deficit = total_gas_needed.saturating_sub(current_balance);
+    if deficit.is_zero() {
+        info!(
+            session_id = %session_id,
+            current_balance = %current_balance,
+            total_gas_needed = %total_gas_needed,
+            "Session wallet already has sufficient gas"
+        );
+        return Ok(());
+    }
+
+    info!(
+        session_id = %session_id,
+        chain = %chain,
+        wallet = %wallet_address,
+        current_balance = %current_balance,
+        total_gas_needed = %total_gas_needed,
+        deficit = %deficit,
+        num_swaps = %num_swaps,
+        gas_price = gas_price,
+        "Funding session wallet with gas"
+    );
+
+    // 8. Resolve gas wallet address
+    let gas_wallet_address: String =
+        sqlx::query_scalar("SELECT address FROM wallets WHERE id = $1::uuid")
+            .bind(gas_wallet_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| format!("Resolve gas wallet address: {e}"))?;
+
+    let gas_wallet_addr: Address = gas_wallet_address
+        .parse()
+        .map_err(|e| format!("Parse gas wallet address: {e}"))?;
+
+    // Check gas wallet has enough balance
+    let gas_wallet_balance = provider
+        .get_balance(gas_wallet_addr)
+        .await
+        .map_err(|e| format!("Get gas wallet balance: {e}"))?;
+
+    if gas_wallet_balance < deficit {
+        return Err(format!(
+            "Gas wallet insufficient: has {} but needs {} (deficit for session {})",
+            gas_wallet_balance, deficit, session_id
+        ));
+    }
+
+    // 9. Build, sign, and submit native transfer from gas wallet to session wallet
+    let nonce = provider
+        .get_transaction_count(gas_wallet_addr)
+        .await
+        .map_err(|e| format!("Get gas wallet nonce: {e}"))?;
+
+    let transfer_tx = TransactionRequest::default()
+        .from(gas_wallet_addr)
+        .to(wallet_addr)
+        .value(deficit)
+        .nonce(nonce)
+        .with_chain_id(chain_id)
+        .gas_limit(21_000u64) // standard native transfer
+        .gas_price(gas_price);
+
+    let unsigned_bytes =
+        serde_json::to_vec(&transfer_tx).map_err(|e| format!("Serialize transfer tx: {e}"))?;
+
+    let mut kms = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|e| format!("KMS connect: {e}"))?;
+
+    let sign_resp = kms
+        .sign_transaction(SignTransactionRequest {
+            wallet_id: gas_wallet_id.to_string(),
+            unsigned_tx: unsigned_bytes,
+            chain_id,
+        })
+        .await
+        .map_err(|e| format!("KMS sign: {e}"))?
+        .into_inner();
+
+    if sign_resp.signed_tx.is_empty() {
+        return Err("KMS returned empty signed transaction".into());
+    }
+
+    let pending = provider
+        .send_raw_transaction(&sign_resp.signed_tx)
+        .await
+        .map_err(|e| format!("Submit gas transfer tx: {e}"))?;
+
+    let tx_hash = format!("{:?}", pending.tx_hash());
+    info!(
+        session_id = %session_id,
+        chain = %chain,
+        tx_hash = %tx_hash,
+        amount = %deficit,
+        from = %gas_wallet_address,
+        to = %wallet_address,
+        "Gas funding transaction submitted"
+    );
+
+    Ok(())
 }
 
 pub async fn get_swap_paths(
@@ -2411,6 +2636,7 @@ pub async fn list_my_wallet_sessions(
         SELECT s.id::text AS session_id, s.status::text AS status,
                s.sell_token_symbol, s.target_token_symbol, s.chain::text AS chain,
                s.total_amount::text AS total_amount, s.amount_sold::text AS amount_sold,
+               s.sell_token_decimals,
                s.pov_percent::float8 AS pov_percent, s.created_at, s.public_slug,
                w.address AS wallet_address
         FROM sessions s
@@ -2433,6 +2659,7 @@ pub async fn list_my_wallet_sessions(
                 "status": r.get::<String, _>("status"),
                 "sell_token_symbol": r.get::<String, _>("sell_token_symbol"),
                 "target_token_symbol": r.get::<String, _>("target_token_symbol"),
+                "sell_token_decimals": r.get::<i32, _>("sell_token_decimals"),
                 "chain": r.get::<String, _>("chain"),
                 "total_amount": r.get::<String, _>("total_amount"),
                 "amount_sold": r.get::<String, _>("amount_sold"),

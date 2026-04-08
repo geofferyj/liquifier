@@ -304,6 +304,14 @@ pub struct ExecutionSettings {
     /// Configurable via APP__EXECUTION__BUY_TRIGGER_ORACLE_ADDRESS.
     #[serde(default = "default_buy_trigger_oracle_address")]
     pub buy_trigger_oracle_address: String,
+    /// Wallet ID used to fund session wallets with native gas tokens (BNB/ETH).
+    /// Configurable via APP__EXECUTION__GAS_WALLET_ID.
+    #[serde(default)]
+    pub gas_wallet_id: String,
+    /// Percentage padding added to estimated gas requirement (default 20%).
+    /// Configurable via APP__EXECUTION__GAS_PADDING_PERCENT.
+    #[serde(default = "default_gas_padding_percent")]
+    pub gas_padding_percent: u32,
 }
 impl Default for ExecutionSettings {
     fn default() -> Self {
@@ -311,6 +319,8 @@ impl Default for ExecutionSettings {
             max_price_impact_bps: default_max_impact(),
             investor_wallet: String::new(),
             buy_trigger_oracle_address: default_buy_trigger_oracle_address(),
+            gas_wallet_id: String::new(),
+            gas_padding_percent: default_gas_padding_percent(),
         }
     }
 }
@@ -319,6 +329,9 @@ fn default_max_impact() -> u32 {
 }
 fn default_buy_trigger_oracle_address() -> String {
     "0x06fd4EBfd011574F6915DE69991e3CfdD3dfC30f".to_string()
+}
+fn default_gas_padding_percent() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Deserialize)]

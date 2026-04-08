@@ -16,7 +16,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { cn, formatTokenAmount, shortenTxHash } from "@/lib/utils";
+import { cn, formatTokenAmount, formatTokenAmountCompact, shortenTxHash } from "@/lib/utils";
 import type { SessionStatus } from "@/lib/types";
 
 export default function PublicSessionPage() {
@@ -168,8 +168,11 @@ export default function PublicSessionPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono">
-              {formatTokenAmount(session.total_amount, session.sell_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono leading-tight break-all"
+              title={formatTokenAmount(session.total_amount, session.sell_token_decimals)}
+            >
+              {formatTokenAmountCompact(session.total_amount, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
           </CardContent>
@@ -181,8 +184,11 @@ export default function PublicSessionPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono text-primary">
-              {formatTokenAmount(amountSold, session.sell_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono text-primary leading-tight break-all"
+              title={formatTokenAmount(amountSold, session.sell_token_decimals)}
+            >
+              {formatTokenAmountCompact(amountSold, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
           </CardContent>
@@ -194,8 +200,11 @@ export default function PublicSessionPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono">
-              {formatTokenAmount(remaining, session.sell_token_decimals)}
+            <p
+              className="text-xl md:text-2xl font-bold font-mono leading-tight break-all"
+              title={formatTokenAmount(remaining, session.sell_token_decimals)}
+            >
+              {formatTokenAmountCompact(remaining, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
           </CardContent>
@@ -207,7 +216,10 @@ export default function PublicSessionPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold font-mono text-primary">
+            <p
+              className="text-xl md:text-2xl font-bold font-mono text-primary leading-tight break-all"
+              title={`$${convertedUsd}`}
+            >
               ${convertedUsd}
             </p>
             <p className="text-xs text-muted-foreground">{session.target_token_symbol}</p>
@@ -293,7 +305,7 @@ export default function PublicSessionPage() {
                         {new Date(trade.executed_at).toLocaleTimeString()}
                       </td>
                       <td className="text-right font-mono">
-                        {trade.sell_amount}
+                        {formatTokenAmount(trade.sell_amount, session.sell_token_decimals)}
                       </td>
                       <td className="text-right font-mono">
                         {(trade.price_impact_bps / 100).toFixed(2)}%
