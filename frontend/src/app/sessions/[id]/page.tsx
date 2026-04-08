@@ -31,7 +31,7 @@ import {
 import type { Session, SessionStatus } from "@/lib/types";
 
 function rawTokenAmountToNumber(raw: string, decimals: number): number {
-  const parsed = Number.parseFloat(formatTokenAmount(raw, decimals));
+  const parsed = Number.parseFloat(formatTokenAmount(raw, decimals).replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
