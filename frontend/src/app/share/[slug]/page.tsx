@@ -16,7 +16,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { cn, formatTokenAmount, formatTokenAmountCompact, shortenTxHash } from "@/lib/utils";
+import { cn, formatTokenAmount, formatTokenAmountCompact, shortenTxHash, tokenAmountToUsd, formatUsd } from "@/lib/utils";
 import type { SessionStatus } from "@/lib/types";
 
 export default function PublicSessionPage() {
@@ -41,6 +41,16 @@ export default function PublicSessionPage() {
   const sessionStoreKey = session?.session_id ?? slug;
   const liveData = useLiveDataStore((s) => s.sessions[sessionStoreKey]);
   const seedSession = useLiveDataStore((s) => s.seedSession);
+
+  const sellTokenUsdPriceQuery = useQuery({
+    queryKey: ["token-usd-price", session?.chain, session?.sell_token],
+    queryFn: () => api.getTokenUsdPrice(session!.chain, session!.sell_token),
+    enabled: !!session?.chain && !!session?.sell_token,
+    staleTime: 5 * 60_000,
+    refetchInterval: 60_000,
+  });
+
+  const sellTokenUsdPrice = sellTokenUsdPriceQuery.data?.usd_price;
 
   const sessionTradesQuery = useQuery({
     queryKey: ["public-session-trades", slug],
@@ -175,6 +185,7 @@ export default function PublicSessionPage() {
               {formatTokenAmountCompact(session.total_amount, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
+            <p className="text-xs text-muted-foreground">{formatUsd(sellTokenUsdPrice ? tokenAmountToUsd(session.total_amount, session.sell_token_decimals, sellTokenUsdPrice) : null)}</p>
           </CardContent>
         </Card>
         <Card>
@@ -191,6 +202,7 @@ export default function PublicSessionPage() {
               {formatTokenAmountCompact(amountSold, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
+            <p className="text-xs text-muted-foreground">{formatUsd(sellTokenUsdPrice ? tokenAmountToUsd(amountSold, session.sell_token_decimals, sellTokenUsdPrice) : null)}</p>
           </CardContent>
         </Card>
         <Card>
@@ -207,6 +219,7 @@ export default function PublicSessionPage() {
               {formatTokenAmountCompact(remaining, session.sell_token_decimals)}
             </p>
             <p className="text-xs text-muted-foreground">{session.sell_token_symbol}</p>
+            <p className="text-xs text-muted-foreground">{formatUsd(sellTokenUsdPrice ? tokenAmountToUsd(remaining, session.sell_token_decimals, sellTokenUsdPrice) : null)}</p>
           </CardContent>
         </Card>
         <Card>
@@ -305,7 +318,10 @@ export default function PublicSessionPage() {
                         {new Date(trade.executed_at).toLocaleTimeString()}
                       </td>
                       <td className="text-right font-mono">
-                        {formatTokenAmount(trade.sell_amount, session.sell_token_decimals)}
+                        <span>{formatTokenAmount(trade.sell_amount, session.sell_token_decimals)}</span>
+                        {sellTokenUsdPrice && (
+                          <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(trade.sell_amount, session.sell_token_decimals, sellTokenUsdPrice))}</p>
+                        )}
                       </td>
                       <td className="text-right font-mono">
                         {(trade.price_impact_bps / 100).toFixed(2)}%

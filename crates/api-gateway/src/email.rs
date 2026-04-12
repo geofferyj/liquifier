@@ -420,4 +420,200 @@ impl EmailSender {
             Err(e) => warn!(email = %user_email, error = %e, "Failed to send trade alert email"),
         }
     }
+
+    /// Send a deposit alert email to the common user who received the deposit.
+    pub async fn send_user_deposit_alert(
+        &self,
+        user_email: &str,
+        username: &str,
+        wallet_address: &str,
+        amount_wei: &str,
+        token: &str,
+        tx_hash: &str,
+        chain: &str,
+    ) {
+        let amount_display = format_wei_as_ether(amount_wei);
+
+        let body = format!(
+            "Deposit Received\n\n\
+             Hi {username},\n\n\
+             A deposit has been received into your wallet:\n\n\
+             Wallet: {wallet_address}\n\
+             Amount: {amount_display}\n\
+             Token: {token}\n\
+             Chain: {chain}\n\
+             Tx Hash: {tx_hash}\n\n\
+             — Liquifier Platform"
+        );
+
+        let html_body = format!(
+            r#"<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h2 style="color: #4F46E5;">Deposit Received</h2>
+  <p>Hi {username}, a deposit has been received into your wallet:</p>
+  <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280; width: 120px;">Wallet</td>
+      <td style="padding: 8px 0; font-family: monospace; font-size: 13px;">{wallet_address}</td>
+    </tr>
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280;">Amount</td>
+      <td style="padding: 8px 0; font-weight: 600;">{amount_display}</td>
+    </tr>
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280;">Token</td>
+      <td style="padding: 8px 0;">{token}</td>
+    </tr>
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280;">Chain</td>
+      <td style="padding: 8px 0;">{chain}</td>
+    </tr>
+    <tr>
+      <td style="padding: 8px 0; color: #6b7280;">Tx Hash</td>
+      <td style="padding: 8px 0; font-family: monospace; font-size: 12px; word-break: break-all;">{tx_hash}</td>
+    </tr>
+  </table>
+  <p style="color: #999; font-size: 12px;">This is an automated alert from the Liquifier platform.</p>
+</body>
+</html>"#
+        );
+
+        let to_mailbox: Mailbox = match user_email.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(email = %user_email, error = %e, "Invalid user email address for deposit alert");
+                return;
+            }
+        };
+
+        let subject = format!("Deposit Received — {} on {}", token, chain);
+
+        let email = match Message::builder()
+            .from(self.from.clone())
+            .to(to_mailbox)
+            .subject(subject)
+            .multipart(
+                lettre::message::MultiPart::alternative()
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(body),
+                    )
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(html_body),
+                    ),
+            ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "Failed to build user deposit alert email");
+                return;
+            }
+        };
+
+        match self.transport.send(email).await {
+            Ok(_) => info!(email = %user_email, "User deposit alert email sent"),
+            Err(e) => {
+                warn!(email = %user_email, error = %e, "Failed to send user deposit alert email")
+            }
+        }
+    }
+
+    /// Send a shortfall alert to a common user when the sale didn't cover the minimum amount.
+    pub async fn send_shortfall_alert(
+        &self,
+        user_email: &str,
+        username: &str,
+        session_id: &str,
+        received_usd: f64,
+        required_usd: f64,
+        shortfall_usd: f64,
+    ) {
+        let body = format!(
+            "Additional Deposit Required\n\n\
+             Hi {username},\n\n\
+             Your selling session (ID: {session_id}) has completed, but the realised \
+             USDT value (${received_usd:.2}) fell short of the minimum deposit \
+             amount (${required_usd:.2}).\n\n\
+             Please deposit an additional ${shortfall_usd:.2} worth of tokens \
+             to bring your total up to the required minimum.\n\n\
+             — Liquifier Platform"
+        );
+
+        let html_body = format!(
+            r#"<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h2 style="color: #dc2626;">Additional Deposit Required</h2>
+  <p>Hi {username},</p>
+  <p>Your selling session has completed, but the realised USDT value fell short of the required amount:</p>
+  <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280; width: 160px;">Session ID</td>
+      <td style="padding: 8px 0; font-family: monospace; font-size: 13px;">{session_id}</td>
+    </tr>
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280;">Realised USDT</td>
+      <td style="padding: 8px 0; font-weight: 600;">${received_usd:.2}</td>
+    </tr>
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280;">Required Minimum</td>
+      <td style="padding: 8px 0; font-weight: 600;">${required_usd:.2}</td>
+    </tr>
+    <tr>
+      <td style="padding: 8px 0; color: #6b7280;">Amount to Deposit</td>
+      <td style="padding: 8px 0; font-weight: 600; color: #dc2626;">${shortfall_usd:.2}</td>
+    </tr>
+  </table>
+  <p>Please top up your wallet with the shortfall amount to continue.</p>
+  <p style="color: #999; font-size: 12px;">This is an automated alert from the Liquifier platform.</p>
+</body>
+</html>"#
+        );
+
+        let to_mailbox: Mailbox = match user_email.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(email = %user_email, error = %e, "Invalid user email for shortfall alert");
+                return;
+            }
+        };
+
+        let subject = format!("Action Required: Additional ${shortfall_usd:.2} Deposit Needed");
+
+        let email = match Message::builder()
+            .from(self.from.clone())
+            .to(to_mailbox)
+            .subject(subject)
+            .multipart(
+                lettre::message::MultiPart::alternative()
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(body),
+                    )
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(html_body),
+                    ),
+            ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "Failed to build shortfall alert email");
+                return;
+            }
+        };
+
+        match self.transport.send(email).await {
+            Ok(_) => {
+                info!(email = %user_email, session_id = %session_id, "Shortfall alert email sent")
+            }
+            Err(e) => {
+                warn!(email = %user_email, error = %e, "Failed to send shortfall alert email")
+            }
+        }
+    }
 }

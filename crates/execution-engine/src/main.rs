@@ -22,7 +22,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::BigDecimal;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::transport::Channel;
@@ -765,6 +765,67 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                 .execute(&state.db)
                 .await;
 
+                // Calculate total received USDT for shortfall check
+                let total_received_row = sqlx::query_scalar::<_, String>(
+                    "SELECT COALESCE(SUM(CAST(final_received AS NUMERIC)), 0)::text FROM trades WHERE session_id = $1 AND status = 'confirmed'",
+                )
+                .bind(session_id_uuid)
+                .fetch_one(&state.db)
+                .await;
+
+                // Check for shortfall: compare received USDT to initial token value
+                if let Ok(total_received_str) = total_received_row {
+                    let cfg = liquifier_config::Settings::global();
+                    let min_deposit_usd = cfg.execution.min_deposit_amount_usd;
+
+                    // Convert total received (in wei) to float USD  (target is USDT, 18 decimals)
+                    let received_f64 = total_received_str.parse::<f64>().unwrap_or(0.0) / 1e18;
+
+                    if received_f64 < min_deposit_usd && received_f64 > 0.0 {
+                        let shortfall = min_deposit_usd - received_f64;
+                        warn!(
+                            session_id = %session.session_id,
+                            received_usd = received_f64,
+                            required_usd = min_deposit_usd,
+                            shortfall_usd = shortfall,
+                            "Session completed with shortfall — alerting user"
+                        );
+
+                        // Look up user email for shortfall alert
+                        let user_row = sqlx::query(
+                            "SELECT u.email, COALESCE(u.username, u.email) AS display_name
+                             FROM sessions s JOIN wallets w ON w.id = s.wallet_id
+                             JOIN users u ON u.id = w.user_id
+                             WHERE s.id = $1 AND u.role = 'common'",
+                        )
+                        .bind(session_id_uuid)
+                        .fetch_optional(&state.db)
+                        .await;
+
+                        if let Ok(Some(row)) = user_row {
+                            let email: String = row.get("email");
+                            let name: String = row.get("display_name");
+                            let _ = state
+                                .nats_js
+                                .publish(
+                                    "session.shortfall",
+                                    serde_json::to_vec(&serde_json::json!({
+                                        "type": "shortfall_alert",
+                                        "session_id": session.session_id,
+                                        "user_email": email,
+                                        "username": name,
+                                        "received_usd": received_f64,
+                                        "required_usd": min_deposit_usd,
+                                        "shortfall_usd": shortfall,
+                                    }))
+                                    .unwrap_or_default()
+                                    .into(),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
                 // Sweep converted funds to investor wallet
                 let investor_addr = {
                     let cfg = liquifier_config::Settings::global();
@@ -785,6 +846,9 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
                         "Failed to sweep funds to investor wallet"
                     );
                 }
+
+                // Check for excess sell token remaining and auto-create refund request
+                check_and_create_excess_refund(&state.kms_client, &state.db, session).await;
             }
         }
     }
@@ -919,6 +983,83 @@ async fn sweep_to_investor(
     }
 
     Ok(())
+}
+
+/// After session completion, check if the sell token still has balance
+/// (i.e., the required USDT target was met and excess token remains).
+/// If so, auto-create a refund request so the user can reclaim it.
+async fn check_and_create_excess_refund(
+    _kms_client: &WalletKmsClient<Channel>,
+    db: &PgPool,
+    session: &SessionInfo,
+) {
+    let sender = match resolve_session_wallet_address(db, &session.wallet_id, &session.chain).await
+    {
+        Ok(addr) => addr,
+        Err(_) => return,
+    };
+
+    let rpc_url = match chain_rpc_url(&session.chain) {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+
+    let parsed_url: alloy::transports::http::reqwest::Url = match rpc_url.parse() {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let provider = ProviderBuilder::new().connect_http(parsed_url);
+
+    let sell_token_addr: Address = match session.sell_token.parse() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    let erc20 = IERC20Approve::new(sell_token_addr, &provider);
+    let remaining_balance = match erc20.balanceOf(sender).call().await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    if remaining_balance.is_zero() {
+        return;
+    }
+
+    // Excess sell token exists — look up wallet + user and create a pending refund request
+    let wallet_row = sqlx::query(
+        "SELECT w.id, w.user_id FROM wallets w WHERE w.id = (SELECT wallet_id FROM sessions WHERE id = $1::uuid)"
+    )
+    .bind(&session.session_id)
+    .fetch_optional(db)
+    .await;
+
+    if let Ok(Some(row)) = wallet_row {
+        let wallet_id: uuid::Uuid = row.get("id");
+        let user_id: uuid::Uuid = row.get("user_id");
+        let refund_id = uuid::Uuid::new_v4();
+
+        let _ = sqlx::query(
+            "INSERT INTO refund_requests (id, user_id, wallet_id, amount, token_address, token_symbol, status)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(refund_id)
+        .bind(user_id)
+        .bind(wallet_id)
+        .bind(remaining_balance.to_string())
+        .bind(&session.sell_token)
+        .bind(&session.sell_token_symbol)
+        .execute(db)
+        .await;
+
+        info!(
+            session_id = %session.session_id,
+            refund_id = %refund_id,
+            amount = %remaining_balance,
+            token = %session.sell_token_symbol,
+            "Auto-created refund request for excess sell token"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────

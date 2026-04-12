@@ -243,3 +243,19 @@ export interface WalletSession {
   public_slug?: string;
   created_at: string;
 }
+
+export interface Deposit {
+  deposit_id: string;
+  chain: string;
+  token_address: string;
+  from_address: string;
+  amount: string;
+  tx_hash: string;
+  block_number: number;
+  log_index: number;
+  created_at: string;
+}
+
+export interface PlatformConfig {
+  min_deposit_amount_usd: number;
+}

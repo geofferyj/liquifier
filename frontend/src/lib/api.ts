@@ -15,6 +15,8 @@ import type {
   AdminUser,
   WalletSession,
   TokenUsdPrice,
+  Deposit,
+  PlatformConfig,
 } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
@@ -391,6 +393,24 @@ class ApiClient {
 
   async listMyWalletSessions(): Promise<{ sessions: WalletSession[] }> {
     return this.request("/api/v1/my/sessions");
+  }
+
+  // ── Common User: Deposit History ───────────────────────────
+
+  async listMyDeposits(): Promise<{ deposits: Deposit[] }> {
+    return this.request("/api/v1/my/deposits");
+  }
+
+  // ── Common User: Start Selling ─────────────────────────────
+
+  async startSelling(): Promise<Session> {
+    return this.request("/api/v1/my/start-selling", { method: "POST" });
+  }
+
+  // ── Platform Config ────────────────────────────────────────
+
+  async getPlatformConfig(): Promise<PlatformConfig> {
+    return this.request("/api/v1/config");
   }
 
   // ── Admin Routes ───────────────────────────────────────────

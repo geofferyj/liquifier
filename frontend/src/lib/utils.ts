@@ -55,3 +55,29 @@ export function shortenTxHash(hash: string): string {
   if (hash.length < 16) return hash;
   return `${hash.slice(0, 10)}...${hash.slice(-6)}`;
 }
+
+export function tokenAmountToNumber(raw: string, decimals: number): number {
+  if (!raw || raw === "0") return 0;
+  const parsed = Number.parseFloat(
+    formatTokenAmount(raw, decimals).replace(/,/g, ""),
+  );
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function tokenAmountToUsd(
+  rawAmount: string,
+  decimals: number,
+  usdPrice: number,
+): number | null {
+  if (!Number.isFinite(usdPrice) || usdPrice <= 0) return null;
+  return tokenAmountToNumber(rawAmount, decimals) * usdPrice;
+}
+
+export function formatUsd(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value))
+    return "—";
+  return `$${value.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}

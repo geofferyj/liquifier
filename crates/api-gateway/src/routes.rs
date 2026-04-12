@@ -2675,6 +2675,142 @@ pub async fn list_my_wallet_sessions(
 }
 
 // ─────────────────────────────────────────────────────────────
+// Common User: Deposit History
+// ─────────────────────────────────────────────────────────────
+
+pub async fn list_my_deposits(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"
+        SELECT d.id::text AS deposit_id, d.chain, d.token_address, d.from_address,
+               d.amount, d.tx_hash, d.block_number, d.log_index, d.created_at
+        FROM deposits d
+        JOIN wallets w ON d.wallet_id = w.id
+        WHERE w.user_id = $1
+        ORDER BY d.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let deposits: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
+            serde_json::json!({
+                "deposit_id": r.get::<String, _>("deposit_id"),
+                "chain": r.get::<String, _>("chain"),
+                "token_address": r.get::<String, _>("token_address"),
+                "from_address": r.get::<String, _>("from_address"),
+                "amount": r.get::<String, _>("amount"),
+                "tx_hash": r.get::<String, _>("tx_hash"),
+                "block_number": r.get::<i64, _>("block_number"),
+                "log_index": r.get::<i32, _>("log_index"),
+                "created_at": created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "deposits": deposits })))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Common User: Start Selling (auto-create pending session)
+// ─────────────────────────────────────────────────────────────
+
+pub async fn start_selling(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "common" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Find user's wallet
+    let wallet_row = sqlx::query(
+        "SELECT id::text AS wallet_id, chain::text AS chain FROM wallets WHERE user_id = $1 LIMIT 1",
+    )
+    .bind(user.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let wallet_id: String = wallet_row.get("wallet_id");
+    let chain: String = wallet_row.get("chain");
+
+    // Get wallet balance for WKC
+    let wkc_token = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
+    let mut kms_client = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let balance_resp = kms_client
+        .get_balance(GetBalanceRequest {
+            wallet_id: wallet_id.clone(),
+            token_address: wkc_token.to_string(),
+            rpc_url: String::new(),
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    let balance = balance_resp.balance;
+    if balance == "0" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // USDT target on BSC
+    let usdt_address = "0x55d398326f99059fF775485246999027B3197955";
+
+    // Create session via gRPC
+    let mut session_client = SessionServiceClient::connect(state.session_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let resp = session_client
+        .create_session(CreateSessionRequest {
+            user_id: user.user_id.to_string(),
+            wallet_id: wallet_id.clone(),
+            chain: chain.clone(),
+            sell_token: wkc_token.to_string(),
+            sell_token_symbol: "WKC".to_string(),
+            sell_token_decimals: 18,
+            target_token: usdt_address.to_string(),
+            target_token_symbol: "USDT".to_string(),
+            target_token_decimals: 18,
+            strategy: "pov".to_string(),
+            total_amount: balance.clone(),
+            pov_percent: 50.0,
+            max_price_impact: 10.0,
+            min_buy_trigger_usd: 0.0,
+            swap_path_json: String::new(),
+            pools: vec![],
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    Ok(Json(session_info_to_json(&resp)))
+}
+
+// ─────────────────────────────────────────────────────────────
+// Public: Platform config for common user frontend
+// ─────────────────────────────────────────────────────────────
+
+pub async fn get_platform_config() -> Json<serde_json::Value> {
+    let cfg = liquifier_config::Settings::global();
+    Json(serde_json::json!({
+        "min_deposit_amount_usd": cfg.execution.min_deposit_amount_usd,
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────
 // Admin: Update User Role
 // ─────────────────────────────────────────────────────────────
 

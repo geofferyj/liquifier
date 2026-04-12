@@ -7,11 +7,12 @@ import { useAuthStore } from "@/lib/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn, shortenAddress, formatTokenAmount } from "@/lib/utils";
+import { cn, shortenAddress, formatTokenAmount, tokenAmountToUsd, formatUsd } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import type { AdminRefundRequest } from "@/lib/types";
 
+const WKC_TOKEN_ADDRESS = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
 const WKC_DECIMALS = 18;
 
 type FilterStatus = "all" | "pending" | "approved" | "rejected" | "completed";
@@ -39,6 +40,15 @@ function AdminRefundsContent() {
     queryFn: () => api.adminListRefundRequests(),
     refetchInterval: 30_000,
   });
+
+  const wkcPriceQuery = useQuery({
+    queryKey: ["wkc-usd-price"],
+    queryFn: () => api.getTokenUsdPrice("bsc", WKC_TOKEN_ADDRESS),
+    staleTime: 5 * 60_000,
+    refetchInterval: 60_000,
+  });
+
+  const wkcPrice = wkcPriceQuery.data?.usd_price ?? 0;
 
   const updateMutation = useMutation({
     mutationFn: ({
@@ -119,6 +129,9 @@ function AdminRefundsContent() {
                   <div className="flex items-center gap-3">
                     <p className="font-semibold">
                       {formatTokenAmount(r.amount, WKC_DECIMALS)} {r.token_symbol}
+                      {wkcPrice > 0 && (
+                        <span className="text-sm font-normal text-muted-foreground ml-2">{formatUsd(tokenAmountToUsd(r.amount, WKC_DECIMALS, wkcPrice))}</span>
+                      )}
                     </p>
                     <span
                       className={cn(

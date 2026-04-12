@@ -107,7 +107,8 @@ async fn main() -> Result<()> {
             get(routes::get_public_session_trades),
         )
         .route("/api/v1/chains", get(routes::list_chains))
-        .route("/api/v1/health", get(routes::health));
+        .route("/api/v1/health", get(routes::health))
+        .route("/api/v1/config", get(routes::get_platform_config));
 
     // Protected routes (JWT required)
     let protected_routes = Router::new()
@@ -163,6 +164,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/refunds", get(routes::list_my_refund_requests))
         // Common user: sessions on their wallets
         .route("/api/v1/my/sessions", get(routes::list_my_wallet_sessions))
+        // Common user: deposit history
+        .route("/api/v1/my/deposits", get(routes::list_my_deposits))
+        // Common user: start selling
+        .route("/api/v1/my/start-selling", post(routes::start_selling))
         // Admin routes
         .route("/api/v1/admin/users", get(routes::admin_list_users))
         .route(
@@ -358,16 +363,16 @@ async fn run_deposit_alert_consumer(
             }
         };
 
-        // Skip alerts for transfer events where the sender is a tracked pool.
+        // Skip alerts for transfer events where the sender is a tracked pool or pair address.
         // These are usually session-driven sells and should not be treated as user deposits.
-        match is_tracked_pool_transfer(db, &deposit.chain, &deposit.from).await {
+        match is_tracked_pool_or_pair_transfer(db, &deposit.chain, &deposit.from).await {
             Ok(true) => {
                 info!(
                     chain = %deposit.chain,
                     from = %deposit.from,
                     to = %deposit.to,
                     tx = %deposit.tx_hash,
-                    "Skipping deposit alert: transfer originated from tracked pool"
+                    "Skipping deposit alert: transfer originated from tracked pool/pair"
                 );
                 let _ = msg.ack().await;
                 continue;
@@ -382,6 +387,28 @@ async fn run_deposit_alert_consumer(
                 );
             }
         }
+
+        // Record deposit to database (idempotent via unique constraint)
+        let deposit_id = uuid::Uuid::new_v4();
+        let wallet_uuid: uuid::Uuid = deposit.wallet_id.parse().unwrap_or_default();
+        let user_uuid: uuid::Uuid = deposit.user_id.parse().unwrap_or_default();
+        let _ = sqlx::query(
+            "INSERT INTO deposits (id, user_id, wallet_id, chain, token_address, from_address, amount, tx_hash, block_number, log_index)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
+        )
+        .bind(deposit_id)
+        .bind(user_uuid)
+        .bind(wallet_uuid)
+        .bind(&deposit.chain)
+        .bind(&deposit.token_address)
+        .bind(&deposit.from)
+        .bind(&deposit.amount)
+        .bind(&deposit.tx_hash)
+        .bind(deposit.block_number as i64)
+        .bind(deposit.log_index as i32)
+        .execute(db)
+        .await;
 
         // Look up user info
         let user_info = sqlx::query(
@@ -404,7 +431,6 @@ async fn run_deposit_alert_consumer(
             }
         };
 
-        // Look up wallet address (in case deposit.to is the address, but let's fetch from DB for certainty)
         let wallet_address = deposit.to.clone();
 
         // Get all admin emails
@@ -424,6 +450,7 @@ async fn run_deposit_alert_consumer(
         };
 
         if let Some(sender) = email_sender {
+            // Send deposit alert to admins
             for admin_email in &admin_emails {
                 sender
                     .send_deposit_alert(
@@ -438,12 +465,24 @@ async fn run_deposit_alert_consumer(
                     )
                     .await;
             }
+            // Also send deposit alert to the user themselves
+            sender
+                .send_user_deposit_alert(
+                    &user_email,
+                    &username,
+                    &wallet_address,
+                    &deposit.amount,
+                    &deposit.token_address,
+                    &deposit.tx_hash,
+                    &deposit.chain,
+                )
+                .await;
             info!(
                 user = %username,
                 token = %deposit.token_address,
                 amount = %deposit.amount,
                 admins_notified = admin_emails.len(),
-                "Deposit alert emails sent"
+                "Deposit alert emails sent (admin + user)"
             );
         } else {
             info!(
@@ -461,7 +500,9 @@ async fn run_deposit_alert_consumer(
     Ok(())
 }
 
-async fn is_tracked_pool_transfer(
+/// Check if the sender address is a tracked pool or pair (from any active session).
+/// This covers both session_pools entries and any known DEX pair addresses.
+async fn is_tracked_pool_or_pair_transfer(
     db: &sqlx::PgPool,
     chain: &str,
     from_address: &str,
@@ -471,16 +512,18 @@ async fn is_tracked_pool_transfer(
             SELECT 1
             FROM session_pools sp
             JOIN sessions s ON s.id = sp.session_id
-            WHERE LOWER(sp.pool_address) = LOWER($1)
+            WHERE (LOWER(sp.pool_address) = LOWER($1)
+                   OR LOWER(sp.token0) = LOWER($1)
+                   OR LOWER(sp.token1) = LOWER($1))
               AND s.chain::text = $2
-              AND s.status = 'active'
+              AND s.status IN ('active', 'pending')
         )",
     )
     .bind(from_address)
     .bind(chain)
     .fetch_one(db)
     .await
-    .context("Failed querying tracked pool address")?;
+    .context("Failed querying tracked pool/pair address")?;
 
     Ok(exists)
 }

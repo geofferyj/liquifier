@@ -77,6 +77,7 @@ execution:
   buy_trigger_oracle_address: "0x06fd4EBfd011574F6915DE69991e3CfdD3dfC30f"  # Override via APP__EXECUTION__BUY_TRIGGER_ORACLE_ADDRESS
   gas_wallet_id: ""          # Override via APP__EXECUTION__GAS_WALLET_ID
   gas_padding_percent: 20    # Extra % added to gas estimate
+  min_deposit_amount_usd: 10000  # Minimum deposit before selling can start. Override via APP__EXECUTION__MIN_DEPOSIT_AMOUNT_USD
 
 # ─── Pricing ──────────────────────────────────────────────────
 pricing:

@@ -312,6 +312,10 @@ pub struct ExecutionSettings {
     /// Configurable via APP__EXECUTION__GAS_PADDING_PERCENT.
     #[serde(default = "default_gas_padding_percent")]
     pub gas_padding_percent: u32,
+    /// Minimum deposit amount (USD) before a common user can start selling.
+    /// Configurable via APP__EXECUTION__MIN_DEPOSIT_AMOUNT_USD.
+    #[serde(default = "default_min_deposit_amount_usd")]
+    pub min_deposit_amount_usd: f64,
 }
 impl Default for ExecutionSettings {
     fn default() -> Self {
@@ -321,6 +325,7 @@ impl Default for ExecutionSettings {
             buy_trigger_oracle_address: default_buy_trigger_oracle_address(),
             gas_wallet_id: String::new(),
             gas_padding_percent: default_gas_padding_percent(),
+            min_deposit_amount_usd: default_min_deposit_amount_usd(),
         }
     }
 }
@@ -332,6 +337,9 @@ fn default_buy_trigger_oracle_address() -> String {
 }
 fn default_gas_padding_percent() -> u32 {
     20
+}
+fn default_min_deposit_amount_usd() -> f64 {
+    10000.0
 }
 
 #[derive(Debug, Clone, Deserialize)]

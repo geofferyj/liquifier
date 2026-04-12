@@ -26,35 +26,12 @@ import {
   formatTokenAmountCompact,
   shortenAddress,
   shortenTxHash,
+  tokenAmountToNumber,
+  tokenAmountToUsd,
+  formatUsd,
   cn,
 } from "@/lib/utils";
 import type { Session, SessionStatus } from "@/lib/types";
-
-function rawTokenAmountToNumber(raw: string, decimals: number): number {
-  const parsed = Number.parseFloat(formatTokenAmount(raw, decimals).replace(/,/g, ""));
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function calculateUsdValue(
-  rawAmount: string,
-  decimals: number,
-  usdPrice?: number,
-): number | null {
-  if (usdPrice === undefined || !Number.isFinite(usdPrice)) {
-    return null;
-  }
-  return rawTokenAmountToNumber(rawAmount, decimals) * usdPrice;
-}
-
-function formatUsd(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) {
-    return "USD —";
-  }
-  return `$${value.toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
 
 export default function SessionDashboardPage() {
   const router = useRouter();
@@ -197,26 +174,10 @@ export default function SessionDashboardPage() {
     .reduce((sum, t) => sum + BigInt(t.received_amount), 0n)
     .toString();
 
-  const totalToSellUsd = calculateUsdValue(
-    session.total_amount,
-    session.sell_token_decimals,
-    sellTokenUsdPrice,
-  );
-  const amountSoldUsd = calculateUsdValue(
-    amountSold,
-    session.sell_token_decimals,
-    sellTokenUsdPrice,
-  );
-  const remainingUsd = calculateUsdValue(
-    remaining,
-    session.sell_token_decimals,
-    sellTokenUsdPrice,
-  );
-  const convertedAmountUsd = calculateUsdValue(
-    convertedAmount,
-    session.target_token_decimals,
-    targetTokenUsdPrice,
-  );
+  const totalToSellUsd = sellTokenUsdPrice ? tokenAmountToUsd(session.total_amount, session.sell_token_decimals, sellTokenUsdPrice) : null;
+  const amountSoldUsd = sellTokenUsdPrice ? tokenAmountToUsd(amountSold, session.sell_token_decimals, sellTokenUsdPrice) : null;
+  const remainingUsd = sellTokenUsdPrice ? tokenAmountToUsd(remaining, session.sell_token_decimals, sellTokenUsdPrice) : null;
+  const convertedAmountUsd = targetTokenUsdPrice ? tokenAmountToUsd(convertedAmount, session.target_token_decimals, targetTokenUsdPrice) : null;
 
   // Build chart data from recent trades
   const chartData = recentTrades
@@ -224,7 +185,7 @@ export default function SessionDashboardPage() {
     .reverse()
     .map((t, i) => ({
       index: i + 1,
-      amount: rawTokenAmountToNumber(t.sell_amount, session.sell_token_decimals),
+      amount: tokenAmountToNumber(t.sell_amount, session.sell_token_decimals),
       impact_bps: t.price_impact_bps,
       time: new Date(t.executed_at).toLocaleTimeString(),
     }));
@@ -663,15 +624,15 @@ export default function SessionDashboardPage() {
                         {new Date(trade.executed_at).toLocaleTimeString()}
                       </td>
                       <td className="text-right font-mono">
-                        {formatTokenAmount(
-                          trade.sell_amount,
-                          session.sell_token_decimals
+                        <span>{formatTokenAmount(trade.sell_amount, session.sell_token_decimals)}</span>
+                        {sellTokenUsdPrice && (
+                          <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(trade.sell_amount, session.sell_token_decimals, sellTokenUsdPrice))}</p>
                         )}
                       </td>
                       <td className="text-right font-mono text-primary">
-                        {formatTokenAmount(
-                          trade.received_amount,
-                          session.target_token_decimals
+                        <span>{formatTokenAmount(trade.received_amount, session.target_token_decimals)}</span>
+                        {targetTokenUsdPrice && (
+                          <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(trade.received_amount, session.target_token_decimals, targetTokenUsdPrice))}</p>
                         )}
                       </td>
                       <td className="text-right font-mono">

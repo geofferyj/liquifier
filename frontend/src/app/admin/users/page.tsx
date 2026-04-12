@@ -11,6 +11,8 @@ import {
   cn,
   shortenAddress,
   formatTokenAmount,
+  tokenAmountToUsd,
+  formatUsd,
 } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -43,6 +45,15 @@ function AdminUsersContent() {
     queryKey: ["admin-refunds"],
     queryFn: () => api.adminListRefundRequests(),
   });
+
+  const wkcPriceQuery = useQuery({
+    queryKey: ["wkc-usd-price"],
+    queryFn: () => api.getTokenUsdPrice("bsc", WKC_TOKEN_ADDRESS),
+    staleTime: 5 * 60_000,
+    refetchInterval: 60_000,
+  });
+
+  const wkcPrice = wkcPriceQuery.data?.usd_price ?? 0;
 
   const [expandedUser, setExpandedUser] = useState<string | null>(null);
   const [userWallets, setUserWallets] = useState<Record<string, Wallet[]>>({});
@@ -198,6 +209,9 @@ function AdminUsersContent() {
                 <div>
                   <p className="text-sm font-medium">
                     {r.username || r.email} — {r.amount} {r.token_symbol}
+                    {wkcPrice > 0 && (
+                      <span className="text-xs font-normal text-muted-foreground ml-1">({formatUsd(tokenAmountToUsd(r.amount, WKC_DECIMALS, wkcPrice))})</span>
+                    )}
                   </p>
                   <p className="text-xs text-muted-foreground">
                     Wallet: {shortenAddress(r.wallet_id)} ·{" "}
@@ -340,6 +354,9 @@ function AdminUsersContent() {
                                       ? "Balance unavailable"
                                       : "Loading balance..."}
                                 </p>
+                                {bal && wkcPrice > 0 && (
+                                  <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(bal.balance, bal.decimals, wkcPrice))}</p>
+                                )}
                               </div>
                               <Button
                                 size="sm"
@@ -431,6 +448,9 @@ function AdminUsersContent() {
                                     s.sell_token_decimals,
                                   )}{" "}
                                   {s.sell_token_symbol}
+                                  {wkcPrice > 0 && (
+                                    <span className="ml-1">({formatUsd(tokenAmountToUsd(s.amount_sold, s.sell_token_decimals, wkcPrice))} / {formatUsd(tokenAmountToUsd(s.total_amount, s.sell_token_decimals, wkcPrice))})</span>
+                                  )}
                                 </span>
                                 <span>{progress.toFixed(1)}% complete</span>
                               </div>

@@ -8,7 +8,7 @@ import { useAuthStore } from "@/lib/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn, formatTokenAmount, shortenAddress } from "@/lib/utils";
+import { cn, formatTokenAmount, shortenAddress, shortenTxHash, tokenAmountToUsd, formatUsd } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 
 const WKC_TOKEN_ADDRESS = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
@@ -57,6 +57,17 @@ function MyDashboardContent() {
     queryFn: () => api.listMyRefundRequests(),
   });
 
+  const depositsQuery = useQuery({
+    queryKey: ["my-deposits"],
+    queryFn: () => api.listMyDeposits(),
+    refetchInterval: 30_000,
+  });
+
+  const platformConfigQuery = useQuery({
+    queryKey: ["platform-config"],
+    queryFn: () => api.getPlatformConfig(),
+  });
+
   const wallet = walletsQuery.data?.wallets?.[0];
 
   const balanceQuery = useQuery({
@@ -67,6 +78,12 @@ function MyDashboardContent() {
     refetchInterval: 30_000,
   });
 
+  const tokenPriceQuery = useQuery({
+    queryKey: ["wkc-usd-price"],
+    queryFn: () => api.getTokenUsdPrice("bsc", WKC_TOKEN_ADDRESS),
+    refetchInterval: 60_000,
+  });
+
   const [desiredUsd, setDesiredUsd] = useState("10000");
   const [walletExpanded, setWalletExpanded] = useState(false);
 
@@ -74,6 +91,13 @@ function MyDashboardContent() {
   const [refundError, setRefundError] = useState("");
   const [refundSuccess, setRefundSuccess] = useState("");
   const [showRefundForm, setShowRefundForm] = useState(false);
+
+  const startSellingMutation = useMutation({
+    mutationFn: () => api.startSelling(),
+    onSuccess: () => {
+      sessionsQuery.refetch();
+    },
+  });
 
   const refundMutation = useMutation({
     mutationFn: () =>
@@ -113,9 +137,22 @@ function MyDashboardContent() {
   const profile = profileQuery.data;
   const sessions = sessionsQuery.data?.sessions ?? [];
   const refunds = refundsQuery.data?.refunds ?? [];
+  const deposits = depositsQuery.data?.deposits ?? [];
   const balance = balanceQuery.data;
+  const minDepositUsd = platformConfigQuery.data?.min_deposit_amount_usd ?? 10000;
+  const wkcPrice = tokenPriceQuery.data?.usd_price ?? 0;
 
   const hasActiveSession = sessions.length > 0;
+
+  // Compute balance in USD for "start selling" eligibility
+  const balanceRaw = balance ? BigInt(balance.balance) : 0n;
+  const balanceUsd = wkcPrice > 0 && balanceRaw > 0n
+    ? Number(balanceRaw) / 1e18 * wkcPrice
+    : 0;
+  const canStartSelling = balanceUsd >= minDepositUsd && !sessions.some(s => s.status === "active" || s.status === "pending");
+
+  // Check if completed session exists (for refund eligibility)
+  const hasCompletedSession = sessions.some(s => s.status === "completed");
 
   return (
     <main className="min-h-screen p-8 max-w-3xl mx-auto">
@@ -214,6 +251,11 @@ function MyDashboardContent() {
                       WKC
                     </span>
                   </p>
+                  {wkcPrice > 0 && balance && (
+                    <p className="text-xs text-muted-foreground">
+                      ≈ ${balanceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
+                    </p>
+                  )}
                 </div>
 
                 <p className="text-xs text-muted-foreground">
@@ -223,7 +265,53 @@ function MyDashboardContent() {
             </div>
           )}
 
-          {/* Deposit Calculator */}
+          {/* Deposit T&C / Disclaimer — moved UP */}
+          {wallet && (
+            <div className="mt-4 p-4 rounded-lg border border-yellow-500/30 bg-yellow-500/5">
+              <p className="text-sm font-semibold text-yellow-600 dark:text-yellow-400 mb-2">
+                ⚠ Important Disclaimer
+              </p>
+              <p className="text-sm text-muted-foreground leading-relaxed">
+                Please be reminded that the minimum deposit amount is{" "}
+                <span className="font-semibold text-foreground">${minDepositUsd.toLocaleString()}</span>.
+                If, after liquidation, the total amount falls below this minimum,
+                you may be required to add more funds to your wallet. For example,
+                if you deposit ${minDepositUsd.toLocaleString()} and the bot is only able to liquidate
+                ${(minDepositUsd - 300).toLocaleString()}, you will need to add $300 to bring the total back to the
+                ${minDepositUsd.toLocaleString()} minimum.
+              </p>
+            </div>
+          )}
+
+          {/* Start Selling Button */}
+          {wallet && canStartSelling && (
+            <div className="mt-4 p-4 rounded-lg border border-green-500/30 bg-green-500/5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-green-600 dark:text-green-400">
+                    Ready to Start Selling
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Your deposit of ≈${balanceUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })} meets the minimum ${minDepositUsd.toLocaleString()} requirement.
+                  </p>
+                </div>
+                <Button
+                  onClick={() => startSellingMutation.mutate()}
+                  disabled={startSellingMutation.isPending}
+                  className="bg-green-600 hover:bg-green-700"
+                >
+                  {startSellingMutation.isPending ? "Starting..." : "Start Selling"}
+                </Button>
+              </div>
+              {startSellingMutation.isError && (
+                <p className="text-sm text-destructive mt-2">
+                  {startSellingMutation.error instanceof Error ? startSellingMutation.error.message : "Failed to start selling"}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Deposit Calculator — moved DOWN */}
           {wallet && (
             <div className="mt-6 p-4 rounded-lg border border-primary/30 bg-primary/5 space-y-3">
               <p className="text-sm font-semibold">Deposit Calculator</p>
@@ -277,24 +365,6 @@ function MyDashboardContent() {
                   {" "}will be deducted on transfer.
                 </p>
               )}
-            </div>
-          )}
-
-          {/* Deposit T&C / Disclaimer */}
-          {wallet && (
-            <div className="mt-4 p-4 rounded-lg border border-yellow-500/30 bg-yellow-500/5">
-              <p className="text-sm font-semibold text-yellow-600 dark:text-yellow-400 mb-2">
-                ⚠ Important Disclaimer
-              </p>
-              <p className="text-sm text-muted-foreground leading-relaxed">
-                Please be reminded that the minimum deposit amount is{" "}
-                <span className="font-semibold text-foreground">$10,000</span>.
-                If, after liquidation, the total amount falls below this minimum,
-                you may be required to add more funds to your wallet. For example,
-                if you deposit $10,000 and the bot is only able to liquidate
-                $9,700, you will need to add $300 to bring the total back to the
-                $10,000 minimum.
-              </p>
             </div>
           )}
         </CardContent>}
@@ -358,14 +428,17 @@ function MyDashboardContent() {
                       <div>
                         <p className="text-muted-foreground">Total</p>
                         <p className="font-medium">{formatTokenAmount(session.total_amount, session.sell_token_decimals)} {session.sell_token_symbol}</p>
+                        {wkcPrice > 0 && <p className="text-muted-foreground">{formatUsd(tokenAmountToUsd(session.total_amount, session.sell_token_decimals, wkcPrice))}</p>}
                       </div>
                       <div>
                         <p className="text-muted-foreground">Sold</p>
                         <p className="font-medium">{formatTokenAmount(session.amount_sold, session.sell_token_decimals)} {session.sell_token_symbol}</p>
+                        {wkcPrice > 0 && <p className="text-muted-foreground">{formatUsd(tokenAmountToUsd(session.amount_sold, session.sell_token_decimals, wkcPrice))}</p>}
                       </div>
                       <div>
                         <p className="text-muted-foreground">Remaining</p>
                         <p className="font-medium">{formatTokenAmount(remaining.toString(), session.sell_token_decimals)} {session.sell_token_symbol}</p>
+                        {wkcPrice > 0 && <p className="text-muted-foreground">{formatUsd(tokenAmountToUsd(remaining.toString(), session.sell_token_decimals, wkcPrice))}</p>}
                       </div>
                     </div>
                     <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -383,6 +456,47 @@ function MyDashboardContent() {
                   </div>
                 );
               })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Deposit History ───────────────────────────────── */}
+      <Card className="mb-8">
+        <CardHeader>
+          <CardTitle>Deposit History</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {deposits.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No deposits received yet.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {deposits.map((d) => (
+                <div
+                  key={d.deposit_id}
+                  className="flex items-center justify-between p-3 rounded-lg bg-muted/50"
+                >
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">
+                      {formatTokenAmount(d.amount, WKC_DECIMALS)} WKC
+                    </p>
+                    {wkcPrice > 0 && (
+                      <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(d.amount, WKC_DECIMALS, wkcPrice))}</p>
+                    )}
+                    <p className="text-xs text-muted-foreground">
+                      From: {shortenAddress(d.from_address)} · Tx: {shortenTxHash(d.tx_hash)}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {new Date(d.created_at).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-green-500/10 text-green-500">
+                    RECEIVED
+                  </span>
+                </div>
+              ))}
             </div>
           )}
         </CardContent>
@@ -423,6 +537,9 @@ function MyDashboardContent() {
                       ? formatTokenAmount(balance.balance, balance.decimals)
                       : "---"}{" "}
                     WKC
+                    {balance && wkcPrice > 0 && (
+                      <span className="ml-1">({formatUsd(tokenAmountToUsd(balance.balance, balance.decimals, wkcPrice))})</span>
+                    )}
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -473,6 +590,9 @@ function MyDashboardContent() {
                     <p className="text-sm font-medium">
                       {formatTokenAmount(r.amount, WKC_DECIMALS)} WKC
                     </p>
+                    {wkcPrice > 0 && (
+                      <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(r.amount, WKC_DECIMALS, wkcPrice))}</p>
+                    )}
                     <p className="text-xs text-muted-foreground">
                       {new Date(r.created_at).toLocaleDateString()}
                     </p>
