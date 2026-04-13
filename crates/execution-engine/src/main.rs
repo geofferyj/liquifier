@@ -12,6 +12,7 @@ use common::{
         session_service_client::SessionServiceClient, wallet_kms_client::WalletKmsClient,
         ActiveSessionsQuery, SessionInfo, SignTransactionRequest,
     },
+    retry::retry,
     types::{
         dex_router_for_chain, pool_type_from_str,
         wrapped_native_token_for_chain as configured_wrapped_native_token_for_chain, DexSwapEvent,
@@ -1803,6 +1804,7 @@ async fn build_sign_and_submit_tx(
     let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
         .parse()
         .with_context(|| format!("Invalid RPC URL for chain {chain}"))?;
+    let rpc_url_for_retry = rpc_url.clone();
     let provider = ProviderBuilder::new().connect_http(rpc_url);
 
     // Fetch nonce
@@ -1904,21 +1906,27 @@ async fn build_sign_and_submit_tx(
         anyhow::bail!("KMS returned empty signed transaction");
     }
 
-    // Submit the signed transaction on-chain
-    let pending = match provider.send_raw_transaction(&signed_tx_bytes).await {
-        Ok(p) => p,
-        Err(e) => {
-            error!(
-                %sender,
-                %to,
-                nonce,
-                chain,
-                rpc_error = %e,
-                "send_raw_transaction failed"
-            );
-            anyhow::bail!("Failed to submit transaction to RPC: {e}");
+    // Submit the signed transaction on-chain (retry up to 3 times for transient RPC errors)
+    let pending = retry("send_raw_transaction", 3, || {
+        let bytes = signed_tx_bytes.clone();
+        let url = rpc_url_for_retry.clone();
+        async move {
+            let p = ProviderBuilder::new().connect_http(url);
+            p.send_raw_transaction(&bytes).await
         }
-    };
+    })
+    .await
+    .map_err(|e| {
+        error!(
+            %sender,
+            %to,
+            nonce,
+            chain,
+            rpc_error = %e,
+            "send_raw_transaction failed"
+        );
+        anyhow::anyhow!("Failed to submit transaction to RPC: {e}")
+    })?;
 
     let submitted_hash = format!("{:?}", pending.tx_hash());
     info!(tx_hash = %submitted_hash, "Transaction submitted on-chain");

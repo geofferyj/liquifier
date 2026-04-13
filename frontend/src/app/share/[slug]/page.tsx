@@ -327,9 +327,14 @@ export default function PublicSessionPage() {
                         {(trade.price_impact_bps / 100).toFixed(2)}%
                       </td>
                       <td className="text-right">
-                        <code className="text-xs text-muted-foreground">
+                        <a
+                          href={`https://bscscan.com/tx/${trade.tx_hash}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-muted-foreground hover:text-primary font-mono underline-offset-2 hover:underline"
+                        >
                           {shortenTxHash(trade.tx_hash)}
-                        </code>
+                        </a>
                       </td>
                     </tr>
                   ))}

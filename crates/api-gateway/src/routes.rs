@@ -995,6 +995,10 @@ pub async fn update_session_status(
 ) -> Result<axum::response::Response, axum::response::Response> {
     use axum::response::IntoResponse as _;
 
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+
     // Validate allowed statuses
     match body.status.as_str() {
         "active" | "paused" | "cancelled" => {}
@@ -1500,6 +1504,9 @@ pub async fn update_session_config(
     Path(session_id): Path<String>,
     Json(body): Json<UpdateSessionConfigBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
     ensure_session_access(&state, &user, &session_id).await?;
 
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
@@ -2750,7 +2757,7 @@ pub async fn admin_get_user_sessions(
                s.total_amount::text AS total_amount, s.amount_sold::text AS amount_sold,
                s.pov_percent::float8 AS pov_percent, s.created_at, s.updated_at,
                s.sell_token_decimals, s.target_token_decimals,
-               s.strategy, s.public_slug,
+               s.strategy::text AS strategy, s.public_slug,
                w.address AS wallet_address
         FROM sessions s
         JOIN wallets w ON s.wallet_id = w.id
@@ -2962,9 +2969,43 @@ pub async fn start_selling(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // ── 3. Compute min_buy_trigger_usd (10% of balance, rounded to nearest magnitude) ──
-    let min_buy_trigger_usd =
-        compute_min_buy_trigger(&balance, sell_token_decimals, min_buy_trigger_percent);
+    // ── 3. Fetch WKC USD price from oracle, then compute min_buy_trigger_usd ──
+    let sell_token_price_usd: f64 = {
+        let cfg = liquifier_config::Settings::global();
+        let chain_cfg = cfg
+            .chains
+            .get(&effective_chain)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let rpc_url = chain_cfg.rpc_url.trim();
+        let oracle_address: Address = cfg
+            .execution
+            .buy_trigger_oracle_address
+            .parse()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let normalized =
+            normalize_token_for_chain(&effective_chain, sell_token.trim()).to_ascii_lowercase();
+        match resolve_cached_oracle_pool(&state, &effective_chain, &normalized, false).await {
+            Ok((pool, _)) => {
+                match fetch_oracle_usd_price_36(rpc_url, oracle_address, &normalized, &pool).await {
+                    Ok(price_36) => price_36.to_string().parse::<f64>().unwrap_or(0.0) / 1e36_f64,
+                    Err(e) => {
+                        tracing::warn!("start_selling: oracle price fetch failed, using 0: {e}");
+                        0.0
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!("start_selling: no oracle pool found for sell token, using price=0");
+                0.0
+            }
+        }
+    };
+    let min_buy_trigger_usd = compute_min_buy_trigger(
+        &balance,
+        sell_token_decimals,
+        sell_token_price_usd,
+        min_buy_trigger_percent,
+    );
 
     // ── 4. Pool discovery ──
     let mut session_client = SessionServiceClient::connect(state.session_addr.clone())
@@ -3097,18 +3138,27 @@ pub async fn start_selling(
     Ok(Json(session_info_to_json(&resp)))
 }
 
-/// Compute min_buy_trigger_usd: take `pct`% of balance as a USD-like value,
+/// Compute min_buy_trigger_usd: take `pct`% of balance value in USD,
 /// then round down to the nearest order of magnitude (10, 100, 1000, …).
-/// Example: balance 11000 tokens → 10% = 1100 → round to 1000.
-fn compute_min_buy_trigger(balance_raw: &str, decimals: u32, pct: f64) -> f64 {
-    let balance_f64 = balance_raw.parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals as i32);
-    let trigger = balance_f64 * (pct / 100.0);
+/// `token_price_usd` is the current USD price of one sell-token unit.
+/// Example: balance 11000 tokens @ $0.001 each → $11 USD → 10% = $1.1 → round to $1.
+/// Capped at $10,000 to avoid absurdly high triggers.
+fn compute_min_buy_trigger(
+    balance_raw: &str,
+    decimals: u32,
+    token_price_usd: f64,
+    pct: f64,
+) -> f64 {
+    let balance_tokens = balance_raw.parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals as i32);
+    let balance_usd = balance_tokens * token_price_usd.max(0.0);
+    let trigger = balance_usd * (pct / 100.0);
     if trigger < 1.0 {
         return 0.0;
     }
     // Round down to nearest power of 10
     let magnitude = 10_f64.powf(trigger.log10().floor());
-    (trigger / magnitude).floor() * magnitude
+    let result = (trigger / magnitude).floor() * magnitude;
+    result.min(10_000.0)
 }
 
 // ─────────────────────────────────────────────────────────────

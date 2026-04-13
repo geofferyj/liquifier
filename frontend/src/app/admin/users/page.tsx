@@ -367,7 +367,6 @@ function AdminUsersContent() {
                               >
                                 Backup
                               </Button>
-                              <span className="text-xs text-muted-foreground ml-1">→</span>
                             </div>
                           );
                         })}
