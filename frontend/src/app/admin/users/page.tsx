@@ -64,6 +64,7 @@ function AdminUsersContent() {
     Record<string, { balance: string; decimals: number } | null>
   >({});
   const [loadingWallets, setLoadingWallets] = useState<string | null>(null);
+  const [walletModal, setWalletModal] = useState<{ wallet: Wallet; userId: string } | null>(null);
 
   // Export wallet state
   const [exportTarget, setExportTarget] = useState<{
@@ -331,7 +332,8 @@ function AdminUsersContent() {
                           return (
                             <div
                               key={w.wallet_id}
-                              className="flex items-center justify-between p-3 rounded bg-background border"
+                              className="flex items-center justify-between p-3 rounded bg-background border cursor-pointer hover:border-primary/50 transition-colors"
+                              onClick={() => setWalletModal({ wallet: w, userId: u.user_id })}
                             >
                               <div className="space-y-0.5">
                                 <CopyableAddress address={w.address} shorten={false} className="text-xs" />
@@ -365,6 +367,7 @@ function AdminUsersContent() {
                               >
                                 Backup
                               </Button>
+                              <span className="text-xs text-muted-foreground ml-1">→</span>
                             </div>
                           );
                         })}
@@ -569,6 +572,93 @@ function AdminUsersContent() {
           </Card>
         </div>
       )}
+      {/* Wallet detail modal */}
+      {walletModal && (() => {
+        const { wallet: w, userId } = walletModal;
+        const bal = walletBalances[w.wallet_id];
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+            onClick={() => setWalletModal(null)}
+          >
+            <div
+              className="bg-background border rounded-xl shadow-xl w-full max-w-md p-6 space-y-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">Wallet Details</h2>
+                <button
+                  aria-label="Close"
+                  onClick={() => setWalletModal(null)}
+                  className="text-muted-foreground hover:text-foreground transition-colors text-xl leading-none"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="space-y-3 text-sm">
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground uppercase tracking-wider">Wallet ID</p>
+                  <div className="flex items-center gap-2 font-mono text-xs break-all">
+                    <span>{w.wallet_id}</span>
+                    <button
+                      className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => navigator.clipboard.writeText(w.wallet_id)}
+                      title="Copy wallet ID"
+                    >
+                      📋
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground uppercase tracking-wider">Address</p>
+                  <CopyableAddress address={w.address} shorten={false} className="text-xs font-mono" />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <p className="text-xs text-muted-foreground uppercase tracking-wider">Chain</p>
+                    <p className="font-mono">{w.chain}</p>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-muted-foreground uppercase tracking-wider">Created</p>
+                    <p>{new Date(w.created_at).toLocaleDateString()}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground uppercase tracking-wider">WKC Balance</p>
+                  <p className="font-semibold">
+                    {bal
+                      ? `${formatTokenAmount(bal.balance, bal.decimals)} WKC`
+                      : bal === null
+                      ? "Unavailable"
+                      : "Loading..."}
+                  </p>
+                  {bal && wkcPrice > 0 && (
+                    <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(bal.balance, bal.decimals, wkcPrice))}</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => {
+                    setWalletModal(null);
+                    handleExportRequest(userId, w.wallet_id);
+                  }}
+                >
+                  Backup Private Key
+                </Button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </main>
   );
 }

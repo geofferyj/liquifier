@@ -83,7 +83,17 @@ class ApiClient {
     }
 
     if (!res.ok) {
-      throw new Error(`API error: ${res.status}`);
+      let message = `API error: ${res.status}`;
+      try {
+        const body = await res.clone().json();
+        if (body?.message) message = body.message;
+        else if (body?.error) message = body.error;
+      } catch {
+        // ignore parse failures
+      }
+      const err = new Error(message) as Error & { status: number };
+      err.status = res.status;
+      throw err;
     }
 
     return res.json();

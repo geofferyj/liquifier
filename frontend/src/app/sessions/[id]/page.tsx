@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/lib/store";
 import {
@@ -66,12 +66,22 @@ export default function SessionDashboardPage() {
     refetchInterval: 15_000,
   });
 
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const statusErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Status mutation
   const statusMutation = useMutation({
     mutationFn: (status: string) =>
       api.updateSessionStatus(sessionId, status),
     onSuccess: () => {
+      setStatusError(null);
       queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+    },
+    onError: (err: unknown) => {
+      const msg = err instanceof Error ? err.message : "Failed to update session status.";
+      setStatusError(msg);
+      if (statusErrorTimer.current) clearTimeout(statusErrorTimer.current);
+      statusErrorTimer.current = setTimeout(() => setStatusError(null), 6000);
     },
   });
 
@@ -264,6 +274,23 @@ export default function SessionDashboardPage() {
           )}
         </div>
       </div>
+
+      {/* Gas / balance error snackbar */}
+      {statusError && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-start gap-3 max-w-lg w-full rounded-lg border border-destructive/40 bg-destructive/10 shadow-lg px-4 py-3 text-sm text-destructive">
+          <span className="flex-1">{statusError}</span>
+          <button
+            aria-label="Dismiss"
+            onClick={() => {
+              if (statusErrorTimer.current) clearTimeout(statusErrorTimer.current);
+              setStatusError(null);
+            }}
+            className="shrink-0 opacity-70 hover:opacity-100 transition-opacity"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Status badge + progress */}
       <div className="space-y-2">

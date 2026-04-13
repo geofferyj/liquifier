@@ -992,26 +992,43 @@ pub async fn update_session_status(
     Extension(user): Extension<AuthUser>,
     Path(session_id): Path<String>,
     Json(body): Json<UpdateStatusBody>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<axum::response::Response, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+
     // Validate allowed statuses
     match body.status.as_str() {
         "active" | "paused" | "cancelled" => {}
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => return Err(StatusCode::BAD_REQUEST.into_response()),
     }
 
-    ensure_session_access(&state, &user, &session_id).await?;
+    ensure_session_access(&state, &user, &session_id)
+        .await
+        .map_err(|s| s.into_response())?;
 
-    // When activating a session, fund the wallet with gas first
+    // When activating a session, ensure the session wallet has sufficient BNB
+    // (native gas token) for the expected swaps. If the balance is short, the
+    // gas wallet is used to top it up. Fail the request if funding cannot be
+    // completed so that the execution engine is never started without gas.
     if body.status == "active" {
         if let Err(e) = fund_session_wallet_gas(&state, &session_id).await {
-            // Log but don't block session start — gas may already be sufficient
-            warn!(session_id = %session_id, error = %e, "Gas funding attempt failed");
+            tracing::error!(session_id = %session_id, error = %e, "Gas funding failed — blocking session start");
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "insufficient_gas",
+                    "message": format!(
+                        "Session wallet does not have sufficient BNB for the expected swaps \
+                         and the gas wallet could not cover the deficit: {e}"
+                    )
+                })),
+            )
+                .into_response());
         }
     }
 
     let mut client = SessionServiceClient::connect(state.session_addr.clone())
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
 
     let resp = client
         .update_session_status(UpdateSessionStatusRequest {
@@ -1021,14 +1038,14 @@ pub async fn update_session_status(
         .await
         .map_err(|e| {
             if e.code() == tonic::Code::NotFound {
-                StatusCode::NOT_FOUND
+                StatusCode::NOT_FOUND.into_response()
             } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         })?
         .into_inner();
 
-    Ok(Json(session_info_to_json(&resp)))
+    Ok(Json(session_info_to_json(&resp)).into_response())
 }
 
 /// Estimate gas required for a session's swaps and transfer native tokens
