@@ -3,6 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, useEffect, type ReactNode } from "react";
 import { useAuthStore } from "@/lib/store";
+import { Navbar } from "@/components/ui/navbar";
 
 export function Providers({ children }: { children: ReactNode }) {
   const hydrate = useAuthStore((s) => s.hydrate);
@@ -24,6 +25,9 @@ export function Providers({ children }: { children: ReactNode }) {
   );
 
   return (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      <Navbar />
+      {children}
+    </QueryClientProvider>
   );
 }

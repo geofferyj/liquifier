@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 
 // ──────────────────────────────────────────────────────
 // Wizard Steps
@@ -937,10 +938,8 @@ export default function SessionCreatePage() {
               <div className="font-mono">{form.chain}</div>
 
               <div className="text-muted-foreground">Wallet</div>
-              <div className="font-mono">
-                {wallets.find((w) => w.wallet_id === form.walletId)?.address.slice(0, 12) ??
-                  form.walletId}
-                …
+              <div>
+                <CopyableAddress address={wallets.find((w) => w.wallet_id === form.walletId)?.address ?? form.walletId} className="text-sm" />
               </div>
 
               <div className="text-muted-foreground">Sell Token</div>

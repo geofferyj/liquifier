@@ -2234,10 +2234,8 @@ fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
 
 #[derive(Deserialize)]
 pub struct CreateRefundRequest {
-    pub wallet_id: String,
-    pub amount: String,
-    pub token_address: String,
-    pub token_symbol: String,
+    pub amount_usd: f64,
+    pub destination_wallet: String,
 }
 
 #[derive(Deserialize)]
@@ -2256,44 +2254,183 @@ pub async fn create_refund_request(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let wallet_id: Uuid = body
-        .wallet_id
-        .parse()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // Verify wallet belongs to user
-    let wallet_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM wallets WHERE id = $1 AND user_id = $2)",
-    )
-    .bind(wallet_id)
-    .bind(user.user_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if !wallet_exists {
-        return Err(StatusCode::NOT_FOUND);
+    if body.amount_usd <= 0.0 {
+        return Err(StatusCode::BAD_REQUEST);
     }
+
+    // Validate destination wallet address format (0x + 40 hex chars)
+    let dest = body.destination_wallet.trim();
+    if !dest.starts_with("0x") || dest.len() != 42 || hex::decode(&dest[2..]).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Find user's wallet
+    let wallet_row = sqlx::query("SELECT id, address FROM wallets WHERE user_id = $1 LIMIT 1")
+        .bind(user.user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let wallet_id: Uuid = wallet_row.get("id");
+
+    // Get sell token config
+    let cfg = liquifier_config::Settings::global();
+    let exec = &cfg.execution;
+    let sell_token = &exec.sell_token;
+    let sell_token_symbol = &exec.sell_token_symbol;
+    let sell_token_decimals = exec.sell_token_decimals;
+
+    // Get current balance
+    let mut kms_client = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let balance_resp = kms_client
+        .get_balance(GetBalanceRequest {
+            wallet_id: wallet_id.to_string(),
+            token_address: sell_token.clone(),
+            rpc_url: String::new(),
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+
+    let balance_raw = balance_resp.balance.parse::<f64>().unwrap_or(0.0)
+        / 10_f64.powi(sell_token_decimals as i32);
+
+    // Get token USD price to compute balance in USD
+    let token_balance_usd = {
+        let oracle_address: Address = cfg
+            .execution
+            .buy_trigger_oracle_address
+            .parse()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let chain_cfg = cfg
+            .chains
+            .get(&exec.session_chain)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        let rpc_url = chain_cfg.rpc_url.trim();
+        if rpc_url.is_empty() {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let (pool, _) =
+            resolve_cached_oracle_pool(&state, &exec.session_chain, sell_token, false).await?;
+        let usd_price_36 = fetch_oracle_usd_price_36(rpc_url, oracle_address, sell_token, &pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let usd_price = usd_price_36.to_string().parse::<f64>().unwrap_or(0.0) / 1e36_f64;
+        balance_raw * usd_price
+    };
+
+    // Refund amount cannot exceed balance in USD
+    if body.amount_usd > token_balance_usd {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Convert USD amount to raw token amount for DB storage
+    let usd_price_per_token = if balance_raw > 0.0 {
+        token_balance_usd / balance_raw
+    } else {
+        0.0
+    };
+    let token_amount = if usd_price_per_token > 0.0 {
+        body.amount_usd / usd_price_per_token
+    } else {
+        0.0
+    };
+    let amount_raw = format!(
+        "{:.0}",
+        token_amount * 10_f64.powi(sell_token_decimals as i32)
+    );
+
+    // Generate verification token
+    let verification_token = Uuid::new_v4().to_string();
+    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
 
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO refund_requests (id, user_id, wallet_id, amount, token_address, token_symbol) VALUES ($1, $2, $3, $4, $5, $6)",
+        r#"INSERT INTO refund_requests (id, user_id, wallet_id, amount, token_address, token_symbol,
+           amount_usd, destination_wallet, verification_token, verification_token_expires_at, verified)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)"#,
     )
     .bind(id)
     .bind(user.user_id)
     .bind(wallet_id)
-    .bind(&body.amount)
-    .bind(&body.token_address)
-    .bind(&body.token_symbol)
+    .bind(&amount_raw)
+    .bind(sell_token)
+    .bind(sell_token_symbol)
+    .bind(body.amount_usd)
+    .bind(dest)
+    .bind(&verification_token)
+    .bind(expires)
     .execute(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Send verification email
+    let user_email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(user.user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(ref email_sender) = state.email {
+        email_sender
+            .send_refund_verification_email(&user_email, &verification_token, body.amount_usd, dest)
+            .await;
+    }
+
+    info!(
+        user_id = %user.user_id,
+        refund_id = %id,
+        amount_usd = body.amount_usd,
+        destination = %dest,
+        "Refund request created — email verification sent"
+    );
+
     Ok(Json(serde_json::json!({
         "refund_id": id.to_string(),
-        "status": "pending",
-        "message": "Refund request submitted."
+        "status": "unverified",
+        "message": "Please check your email to confirm this refund request."
     })))
+}
+
+pub async fn verify_refund(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let token = params.get("token").ok_or(StatusCode::BAD_REQUEST)?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE refund_requests
+        SET verified = TRUE, status = 'pending',
+            verification_token = NULL, verification_token_expires_at = NULL,
+            updated_at = NOW()
+        WHERE verification_token = $1
+          AND verification_token_expires_at > NOW()
+          AND verified = FALSE
+        RETURNING id::text
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
+        Some(row) => {
+            let refund_id: String = row.get("id");
+            info!(refund_id = %refund_id, "Refund request verified via email");
+            Ok(Json(serde_json::json!({
+                "verified": true,
+                "refund_id": refund_id,
+                "message": "Refund request verified and submitted for admin review."
+            })))
+        }
+        None => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 pub async fn list_my_refund_requests(
@@ -2302,7 +2439,9 @@ pub async fn list_my_refund_requests(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rows = sqlx::query(
         r#"
-        SELECT id::text, wallet_id::text, amount, token_address, token_symbol, status, admin_note, created_at, updated_at
+        SELECT id::text, wallet_id::text, amount, token_address, token_symbol, status,
+               admin_note, created_at, updated_at,
+               amount_usd, destination_wallet, verified
         FROM refund_requests WHERE user_id = $1 ORDER BY created_at DESC
         "#,
     )
@@ -2316,6 +2455,7 @@ pub async fn list_my_refund_requests(
         .map(|r| {
             let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = r.get("updated_at");
+            let amount_usd: Option<sqlx::types::BigDecimal> = r.get("amount_usd");
             serde_json::json!({
                 "refund_id": r.get::<String, _>("id"),
                 "wallet_id": r.get::<String, _>("wallet_id"),
@@ -2326,6 +2466,9 @@ pub async fn list_my_refund_requests(
                 "admin_note": r.get::<Option<String>, _>("admin_note"),
                 "created_at": created_at.to_rfc3339(),
                 "updated_at": updated_at.to_rfc3339(),
+                "amount_usd": amount_usd.map(|v| v.to_string()),
+                "destination_wallet": r.get::<Option<String>, _>("destination_wallet"),
+                "verified": r.get::<bool, _>("verified"),
             })
         })
         .collect();
@@ -2485,9 +2628,13 @@ pub async fn admin_list_refund_requests(
         r#"
         SELECT r.id::text, r.user_id::text, r.wallet_id::text, r.amount, r.token_address,
                r.token_symbol, r.status, r.admin_note, r.created_at, r.updated_at,
-               u.email, u.username
+               r.amount_usd, r.destination_wallet, r.verified,
+               u.email, u.username,
+               w.address AS wallet_address
         FROM refund_requests r
         JOIN users u ON u.id = r.user_id
+        LEFT JOIN wallets w ON w.id = r.wallet_id
+        WHERE r.verified = TRUE
         ORDER BY r.created_at DESC
         "#,
     )
@@ -2500,10 +2647,12 @@ pub async fn admin_list_refund_requests(
         .map(|r| {
             let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = r.get("updated_at");
+            let amount_usd: Option<sqlx::types::BigDecimal> = r.get("amount_usd");
             serde_json::json!({
                 "refund_id": r.get::<String, _>("id"),
                 "user_id": r.get::<String, _>("user_id"),
                 "wallet_id": r.get::<String, _>("wallet_id"),
+                "wallet_address": r.get::<Option<String>, _>("wallet_address"),
                 "email": r.get::<String, _>("email"),
                 "username": r.get::<Option<String>, _>("username"),
                 "amount": r.get::<String, _>("amount"),
@@ -2513,6 +2662,9 @@ pub async fn admin_list_refund_requests(
                 "admin_note": r.get::<Option<String>, _>("admin_note"),
                 "created_at": created_at.to_rfc3339(),
                 "updated_at": updated_at.to_rfc3339(),
+                "amount_usd": amount_usd.map(|v| v.to_string()),
+                "destination_wallet": r.get::<Option<String>, _>("destination_wallet"),
+                "verified": r.get::<bool, _>("verified"),
             })
         })
         .collect();
@@ -2731,33 +2883,61 @@ pub async fn start_selling(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Find user's wallet
+    let cfg = liquifier_config::Settings::global();
+    let exec = &cfg.execution;
+
+    let sell_token = exec.sell_token.clone();
+    let sell_token_symbol = exec.sell_token_symbol.clone();
+    let sell_token_decimals = exec.sell_token_decimals;
+    let target_token = exec.target_token.clone();
+    let target_token_symbol = exec.target_token_symbol.clone();
+    let target_token_decimals = exec.target_token_decimals;
+    let session_chain = exec.session_chain.clone();
+    let pov_percent = exec.pov_percent;
+    let max_price_impact = exec.session_max_price_impact;
+    let min_buy_trigger_percent = exec.min_buy_trigger_percent;
+
+    // ── 1. Find user's wallet ──
     let wallet_row = sqlx::query(
         "SELECT id::text AS wallet_id, chain::text AS chain FROM wallets WHERE user_id = $1 LIMIT 1",
     )
     .bind(user.user_id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        tracing::error!("start_selling: DB wallet lookup failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
     let wallet_id: String = wallet_row.get("wallet_id");
     let chain: String = wallet_row.get("chain");
+    // Use configured chain if wallet chain matches, otherwise fall back to wallet chain
+    let effective_chain = if chain == session_chain {
+        session_chain.clone()
+    } else {
+        chain
+    };
 
-    // Get wallet balance for WKC
-    let wkc_token = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
+    // ── 2. Get sell-token balance ──
     let mut kms_client = WalletKmsClient::connect(state.kms_addr.clone())
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|e| {
+            tracing::error!("start_selling: KMS connect failed: {e}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
 
     let balance_resp = kms_client
         .get_balance(GetBalanceRequest {
             wallet_id: wallet_id.clone(),
-            token_address: wkc_token.to_string(),
+            token_address: sell_token.clone(),
             rpc_url: String::new(),
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!("start_selling: get_balance failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .into_inner();
 
     let balance = balance_resp.balance;
@@ -2765,38 +2945,153 @@ pub async fn start_selling(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // USDT target on BSC
-    let usdt_address = "0x55d398326f99059fF775485246999027B3197955";
+    // ── 3. Compute min_buy_trigger_usd (10% of balance, rounded to nearest magnitude) ──
+    let min_buy_trigger_usd =
+        compute_min_buy_trigger(&balance, sell_token_decimals, min_buy_trigger_percent);
 
-    // Create session via gRPC
+    // ── 4. Pool discovery ──
     let mut session_client = SessionServiceClient::connect(state.session_addr.clone())
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|e| {
+            tracing::error!("start_selling: Session gRPC connect failed: {e}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
 
+    let discover_resp = session_client
+        .discover_pools(DiscoverPoolsRequest {
+            chain: effective_chain.clone(),
+            token_address: sell_token.clone(),
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("start_selling: discover_pools failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .into_inner();
+
+    if discover_resp.pools.is_empty() {
+        tracing::error!("start_selling: no pools discovered for sell token {sell_token}");
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // ── 5. Select pool with highest reserves for the sell token ──
+    let best_pool = discover_resp
+        .pools
+        .iter()
+        .max_by(|a, b| {
+            let res_a = pool_token_liquidity_metric(a, &sell_token).unwrap_or(U256::ZERO);
+            let res_b = pool_token_liquidity_metric(b, &sell_token).unwrap_or(U256::ZERO);
+            res_a.cmp(&res_b)
+        })
+        .ok_or_else(|| {
+            tracing::error!("start_selling: could not select best pool");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .clone();
+
+    info!(
+        pool = %best_pool.pool_address,
+        pool_type = %best_pool.pool_type,
+        dex = %best_pool.dex_name,
+        "start_selling: selected best pool by reserves"
+    );
+
+    // ── 6. Compute swap route for selected pool ──
+    let path_resp = session_client
+        .compute_pool_path(ComputePoolPathRequest {
+            chain: effective_chain.clone(),
+            sell_token: sell_token.clone(),
+            target_token: target_token.clone(),
+            pool_address: best_pool.pool_address.clone(),
+            pool_type: best_pool.pool_type.clone(),
+            token0: best_pool.token0.clone(),
+            token1: best_pool.token1.clone(),
+            fee_tier: best_pool.fee_tier,
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("start_selling: compute_pool_path failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .into_inner();
+
+    // Build the swap_path_json from the computed path (or fall back to pool's default)
+    let swap_path_json = if let Some(ref path) = path_resp.path {
+        serde_json::json!({
+            "hops": path.hops,
+            "hop_tokens": path.hop_tokens,
+            "fee_tiers": [],
+            "estimated_output": path.estimated_output,
+            "estimated_price_impact": path.estimated_price_impact,
+            "fee_percent": path.fee_percent,
+        })
+        .to_string()
+    } else if !best_pool.swap_path_json.is_empty() {
+        best_pool.swap_path_json.clone()
+    } else {
+        tracing::error!("start_selling: no swap route found for best pool");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    // Attach the computed swap_path_json to the pool for session creation
+    let session_pool = PoolInfo {
+        swap_path_json: swap_path_json.clone(),
+        ..best_pool.clone()
+    };
+
+    info!(
+        sell_token = %sell_token,
+        target_token = %target_token,
+        balance = %balance,
+        pool = %best_pool.pool_address,
+        min_buy_trigger_usd = min_buy_trigger_usd,
+        pov = pov_percent,
+        max_impact = max_price_impact,
+        "start_selling: creating session with auto-selected pool and swap route"
+    );
+
+    // ── 7. Create session with pool + swap route ──
     let resp = session_client
         .create_session(CreateSessionRequest {
             user_id: user.user_id.to_string(),
             wallet_id: wallet_id.clone(),
-            chain: chain.clone(),
-            sell_token: wkc_token.to_string(),
-            sell_token_symbol: "WKC".to_string(),
-            sell_token_decimals: 18,
-            target_token: usdt_address.to_string(),
-            target_token_symbol: "USDT".to_string(),
-            target_token_decimals: 18,
+            chain: effective_chain.clone(),
+            sell_token,
+            sell_token_symbol,
+            sell_token_decimals,
+            target_token,
+            target_token_symbol,
+            target_token_decimals,
             strategy: "pov".to_string(),
             total_amount: balance.clone(),
-            pov_percent: 50.0,
-            max_price_impact: 10.0,
-            min_buy_trigger_usd: 0.0,
-            swap_path_json: String::new(),
-            pools: vec![],
+            pov_percent,
+            max_price_impact,
+            min_buy_trigger_usd,
+            swap_path_json,
+            pools: vec![session_pool],
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!("start_selling: create_session failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .into_inner();
 
     Ok(Json(session_info_to_json(&resp)))
+}
+
+/// Compute min_buy_trigger_usd: take `pct`% of balance as a USD-like value,
+/// then round down to the nearest order of magnitude (10, 100, 1000, …).
+/// Example: balance 11000 tokens → 10% = 1100 → round to 1000.
+fn compute_min_buy_trigger(balance_raw: &str, decimals: u32, pct: f64) -> f64 {
+    let balance_f64 = balance_raw.parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals as i32);
+    let trigger = balance_f64 * (pct / 100.0);
+    if trigger < 1.0 {
+        return 0.0;
+    }
+    // Round down to nearest power of 10
+    let magnitude = 10_f64.powf(trigger.log10().floor());
+    (trigger / magnitude).floor() * magnitude
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2805,8 +3100,19 @@ pub async fn start_selling(
 
 pub async fn get_platform_config() -> Json<serde_json::Value> {
     let cfg = liquifier_config::Settings::global();
+    let exec = &cfg.execution;
     Json(serde_json::json!({
-        "min_deposit_amount_usd": cfg.execution.min_deposit_amount_usd,
+        "min_deposit_amount_usd": exec.min_deposit_amount_usd,
+        "sell_token": exec.sell_token,
+        "sell_token_symbol": exec.sell_token_symbol,
+        "sell_token_decimals": exec.sell_token_decimals,
+        "target_token": exec.target_token,
+        "target_token_symbol": exec.target_token_symbol,
+        "target_token_decimals": exec.target_token_decimals,
+        "session_chain": exec.session_chain,
+        "pov_percent": exec.pov_percent,
+        "session_max_price_impact": exec.session_max_price_impact,
+        "min_buy_trigger_percent": exec.min_buy_trigger_percent,
     }))
 }
 

@@ -108,7 +108,8 @@ async fn main() -> Result<()> {
         )
         .route("/api/v1/chains", get(routes::list_chains))
         .route("/api/v1/health", get(routes::health))
-        .route("/api/v1/config", get(routes::get_platform_config));
+        .route("/api/v1/config", get(routes::get_platform_config))
+        .route("/api/v1/refunds/verify", get(routes::verify_refund));
 
     // Protected routes (JWT required)
     let protected_routes = Router::new()

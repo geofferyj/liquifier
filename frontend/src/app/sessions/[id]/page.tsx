@@ -31,6 +31,7 @@ import {
   formatUsd,
   cn,
 } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 import type { Session, SessionStatus } from "@/lib/types";
 
 export default function SessionDashboardPage() {
@@ -38,6 +39,7 @@ export default function SessionDashboardPage() {
   const params = useParams<{ id: string }>();
   const sessionId = params.id;
   const queryClient = useQueryClient();
+  const role = useAuthStore((s) => s.role);
 
   // Fetch session data
   const sessionQuery = useQuery({
@@ -225,8 +227,8 @@ export default function SessionDashboardPage() {
             )}
           </div>
 
-          {/* Play / Pause / Stop controls */}
-          {status === "pending" && (
+          {/* Play / Pause / Stop controls (admin only) */}
+          {role === "admin" && status === "pending" && (
             <Button
               onClick={() => statusMutation.mutate("active")}
               disabled={statusMutation.isPending}
@@ -234,7 +236,7 @@ export default function SessionDashboardPage() {
               Start
             </Button>
           )}
-          {status === "active" && (
+          {role === "admin" && status === "active" && (
             <Button
               variant="secondary"
               onClick={() => statusMutation.mutate("paused")}
@@ -243,7 +245,7 @@ export default function SessionDashboardPage() {
               Pause
             </Button>
           )}
-          {status === "paused" && (
+          {role === "admin" && status === "paused" && (
             <Button
               onClick={() => statusMutation.mutate("active")}
               disabled={statusMutation.isPending}
@@ -251,7 +253,7 @@ export default function SessionDashboardPage() {
               Resume
             </Button>
           )}
-          {(status === "active" || status === "paused") && (
+          {role === "admin" && (status === "active" || status === "paused") && (
             <Button
               variant="destructive"
               onClick={() => statusMutation.mutate("cancelled")}
@@ -543,6 +545,113 @@ export default function SessionDashboardPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Pool & Swap Route */}
+      {session.pools && session.pools.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Pool &amp; Swap Route</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {session.pools.map((pool) => {
+              const swapPath = (() => {
+                try { return pool.swap_path_json ? JSON.parse(pool.swap_path_json) : null; } catch { return null; }
+              })();
+              return (
+                <div
+                  key={pool.pool_address}
+                  className="border border-border rounded-lg p-4 space-y-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium px-2 py-0.5 rounded bg-primary/10 text-primary uppercase">
+                        {pool.pool_type}
+                      </span>
+                      <span className="text-sm font-medium">{pool.dex_name}</span>
+                    </div>
+                    <CopyableAddress address={pool.pool_address} className="text-xs text-muted-foreground" />
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                    <div>
+                      <span className="text-muted-foreground">Token 0</span>
+                      <CopyableAddress address={pool.token0} className="text-xs" />
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Token 1</span>
+                      <CopyableAddress address={pool.token1} className="text-xs" />
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Fee Tier</span>
+                      <p className="font-mono">{pool.fee_tier > 0 ? `${(pool.fee_tier / 100).toFixed(2)}%` : "0.3% (V2)"}</p>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Reserves / Liquidity</span>
+                      <p className="font-mono text-xs">
+                        {pool.pool_type === "v2"
+                          ? `${formatTokenAmountCompact(pool.reserve0, 18)} / ${formatTokenAmountCompact(pool.reserve1, 18)}`
+                          : formatTokenAmountCompact(pool.liquidity || "0", 18)}
+                      </p>
+                    </div>
+                  </div>
+                  {swapPath && swapPath.hop_tokens && (
+                    <div className="pt-2 border-t border-border/50">
+                      <span className="text-xs text-muted-foreground">Swap Route</span>
+                      <div className="flex items-center gap-1 mt-1 flex-wrap">
+                        {swapPath.hop_tokens.map((token: string, i: number) => (
+                          <span key={i} className="flex items-center gap-1">
+                            <CopyableAddress address={token} className="text-xs bg-secondary px-1.5 py-0.5 rounded" />
+                            {i < swapPath.hop_tokens.length - 1 && (
+                              <span className="text-muted-foreground text-xs">→</span>
+                            )}
+                          </span>
+                        ))}
+                      </div>
+                      {swapPath.estimated_price_impact != null && (
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Est. impact: {swapPath.estimated_price_impact.toFixed(2)}% · Fee: {swapPath.fee_percent?.toFixed(2) ?? "—"}%
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Swap Path (session-level) */}
+      {session.swap_path_json && session.swap_path_json.trim() !== "" && (
+        (() => {
+          let sp: { hops?: string[]; hop_tokens?: string[]; estimated_price_impact?: number; fee_percent?: number } | null = null;
+          try { sp = JSON.parse(session.swap_path_json); } catch { /* ignore */ }
+          if (!sp || !sp.hop_tokens) return null;
+          return (
+            <Card>
+              <CardHeader>
+                <CardTitle>Active Swap Path</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center gap-1 flex-wrap">
+                  {sp.hop_tokens!.map((token: string, i: number) => (
+                    <span key={i} className="flex items-center gap-1">
+                      <CopyableAddress address={token} className="text-xs bg-secondary px-1.5 py-0.5 rounded" />
+                      {i < sp!.hop_tokens!.length - 1 && (
+                        <span className="text-muted-foreground text-xs">→</span>
+                      )}
+                    </span>
+                  ))}
+                </div>
+                <div className="flex gap-4 mt-2 text-xs text-muted-foreground">
+                  {sp.hops && <span>Hops: {sp.hops.length}</span>}
+                  {sp.estimated_price_impact != null && <span>Est. Impact: {sp.estimated_price_impact.toFixed(2)}%</span>}
+                  {sp.fee_percent != null && <span>Fee: {sp.fee_percent.toFixed(2)}%</span>}
+                </div>
+              </CardContent>
+            </Card>
+          );
+        })()
+      )}
 
       {/* Public Sharing Toggle */}
       <Card>

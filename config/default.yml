@@ -78,6 +78,17 @@ execution:
   gas_wallet_id: ""          # Override via APP__EXECUTION__GAS_WALLET_ID
   gas_padding_percent: 20    # Extra % added to gas estimate
   min_deposit_amount_usd: 10000  # Minimum deposit before selling can start. Override via APP__EXECUTION__MIN_DEPOSIT_AMOUNT_USD
+  # ── Start-selling defaults (common user flow) ──
+  sell_token: "0x6Ec90334d89dBdc89E08A133271be3d104128Edb"   # WKC on BSC
+  sell_token_symbol: "WKC"
+  sell_token_decimals: 18
+  target_token: "0x55d398326f99059fF775485246999027B3197955"  # USDT on BSC
+  target_token_symbol: "USDT"
+  target_token_decimals: 18
+  session_chain: "bsc"
+  pov_percent: 50.0
+  session_max_price_impact: 10.0
+  min_buy_trigger_percent: 10.0  # % of total balance, rounded to nearest magnitude
 
 # ─── Pricing ──────────────────────────────────────────────────
 pricing:

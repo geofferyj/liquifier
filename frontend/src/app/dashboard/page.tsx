@@ -11,6 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn, shortenAddress } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 import type { SessionStatus } from "@/lib/types";
 
 export default function DashboardPage() {
@@ -135,7 +136,7 @@ export default function DashboardPage() {
                   {/* Details */}
                   <div className="flex-1 flex items-center justify-between">
                     <div>
-                      <code className="text-sm break-all select-all">{w.address}</code>
+                      <CopyableAddress address={w.address} shorten={false} className="text-sm break-all" />
                       <p className="text-xs text-muted-foreground mt-0.5">
                         {w.chain?.toUpperCase()} · Created {new Date(w.created_at).toLocaleDateString()}
                       </p>
@@ -214,7 +215,7 @@ export default function DashboardPage() {
                 </Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                Address: {exportedKey.address}
+                Address: <CopyableAddress address={exportedKey.address} shorten={false} className="text-xs" />
               </p>
               <Button
                 size="sm"

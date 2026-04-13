@@ -191,12 +191,16 @@ export interface RefundRequest {
   admin_note?: string;
   created_at: string;
   updated_at: string;
+  amount_usd?: string;
+  destination_wallet?: string;
+  verified: boolean;
 }
 
 export interface AdminRefundRequest extends RefundRequest {
   user_id: string;
   email: string;
   username?: string;
+  wallet_address?: string;
 }
 
 export interface AdminUser {
@@ -258,4 +262,14 @@ export interface Deposit {
 
 export interface PlatformConfig {
   min_deposit_amount_usd: number;
+  sell_token: string;
+  sell_token_symbol: string;
+  sell_token_decimals: number;
+  target_token: string;
+  target_token_symbol: string;
+  target_token_decimals: number;
+  session_chain: string;
+  pov_percent: number;
+  session_max_price_impact: number;
+  min_buy_trigger_percent: number;
 }

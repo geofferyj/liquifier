@@ -76,12 +76,6 @@ impl SessionService for SessionServiceImpl {
             .map_err(|_| Status::invalid_argument("Invalid wallet_id"))?;
         let session_id = Uuid::new_v4();
 
-        if req.pools.is_empty() {
-            return Err(Status::invalid_argument(
-                "At least one pool with a valid swap_path_json is required",
-            ));
-        }
-
         let mut parsed_pool_paths = Vec::with_capacity(req.pools.len());
         for pool in &req.pools {
             parsed_pool_paths.push(parse_pool_swap_path_json(

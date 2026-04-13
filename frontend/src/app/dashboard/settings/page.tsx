@@ -6,6 +6,7 @@ import { useAuthStore } from "@/lib/store";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 import type { Wallet } from "@/lib/types";
 import { useRouter } from "next/navigation";
 
@@ -139,7 +140,7 @@ export default function SettingsPage() {
               className="flex items-center justify-between border-b border-border pb-3 last:border-0"
             >
               <div>
-                <p className="font-mono text-sm">{w.address}</p>
+                <CopyableAddress address={w.address} shorten={false} className="text-sm" />
                 <p className="text-xs text-muted-foreground">
                   {w.chain} · Created{" "}
                   {new Date(w.created_at).toLocaleDateString()}

@@ -9,7 +9,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn, formatTokenAmount, shortenAddress, shortenTxHash, tokenAmountToUsd, formatUsd } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 import { useRouter } from "next/navigation";
+import type { Deposit } from "@/lib/types";
 
 const WKC_TOKEN_ADDRESS = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
 const WKC_DECIMALS = 18;
@@ -88,9 +90,11 @@ function MyDashboardContent() {
   const [walletExpanded, setWalletExpanded] = useState(false);
 
   const [refundAmount, setRefundAmount] = useState("");
+  const [refundDestWallet, setRefundDestWallet] = useState("");
   const [refundError, setRefundError] = useState("");
   const [refundSuccess, setRefundSuccess] = useState("");
   const [showRefundForm, setShowRefundForm] = useState(false);
+  const [selectedDeposit, setSelectedDeposit] = useState<Deposit | null>(null);
 
   const startSellingMutation = useMutation({
     mutationFn: () => api.startSelling(),
@@ -102,14 +106,13 @@ function MyDashboardContent() {
   const refundMutation = useMutation({
     mutationFn: () =>
       api.createRefundRequest({
-        wallet_id: wallet!.wallet_id,
-        amount: refundAmount,
-        token_address: WKC_TOKEN_ADDRESS,
-        token_symbol: "WKC",
+        amount_usd: parseFloat(refundAmount),
+        destination_wallet: refundDestWallet.trim(),
       }),
     onSuccess: (data) => {
       setRefundSuccess(data.message);
       setRefundAmount("");
+      setRefundDestWallet("");
       setRefundError("");
       refundsQuery.refetch();
     },
@@ -124,7 +127,20 @@ function MyDashboardContent() {
     e.preventDefault();
     setRefundError("");
     setRefundSuccess("");
-    if (!refundAmount || !wallet) return;
+    const amt = parseFloat(refundAmount);
+    if (!amt || amt <= 0) {
+      setRefundError("Enter a valid USD amount");
+      return;
+    }
+    if (balanceUsd !== null && amt > balanceUsd) {
+      setRefundError("Refund amount exceeds your balance");
+      return;
+    }
+    const dest = refundDestWallet.trim();
+    if (!dest.match(/^0x[0-9a-fA-F]{40}$/)) {
+      setRefundError("Enter a valid wallet address (0x...)");
+      return;
+    }
     refundMutation.mutate();
   };
 
@@ -183,7 +199,7 @@ function MyDashboardContent() {
               My Wallet
               {hasActiveSession && wallet && (
                 <span className="text-sm font-normal text-muted-foreground">
-                  · {shortenAddress(wallet.address)}
+                  · <CopyableAddress address={wallet.address} className="text-sm" />
                   {balance
                     ? ` · ${formatTokenAmount(balance.balance, balance.decimals)} WKC`
                     : ""}
@@ -229,9 +245,7 @@ function MyDashboardContent() {
               <div className="flex-1 space-y-3">
                 <div>
                   <p className="text-xs text-muted-foreground">Address</p>
-                  <code className="text-sm break-all select-all">
-                    {wallet.address}
-                  </code>
+                  <CopyableAddress address={wallet.address} shorten={false} className="text-sm break-all" />
                 </div>
 
                 <div>
@@ -405,7 +419,7 @@ function MyDashboardContent() {
                         </p>
                         <p className="text-xs text-muted-foreground">
                           {session.chain} · Wallet:{" "}
-                          {shortenAddress(session.wallet_address)}
+                          <CopyableAddress address={session.wallet_address} className="text-xs" />
                         </p>
                       </div>
                       <span
@@ -476,7 +490,8 @@ function MyDashboardContent() {
               {deposits.map((d) => (
                 <div
                   key={d.deposit_id}
-                  className="flex items-center justify-between p-3 rounded-lg bg-muted/50"
+                  className="flex items-center justify-between p-3 rounded-lg bg-muted/50 cursor-pointer hover:bg-muted/80 transition-colors"
+                  onClick={() => setSelectedDeposit(d)}
                 >
                   <div className="space-y-0.5">
                     <p className="text-sm font-medium">
@@ -486,7 +501,7 @@ function MyDashboardContent() {
                       <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(d.amount, WKC_DECIMALS, wkcPrice))}</p>
                     )}
                     <p className="text-xs text-muted-foreground">
-                      From: {shortenAddress(d.from_address)} · Tx: {shortenTxHash(d.tx_hash)}
+                      From: <CopyableAddress address={d.from_address} className="text-xs" /> · Tx: {shortenTxHash(d.tx_hash)}
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {new Date(d.created_at).toLocaleDateString()}
@@ -520,33 +535,46 @@ function MyDashboardContent() {
         <CardContent>
           {showRefundForm && (
             <div className="mb-4 p-4 rounded-lg border border-primary/30 bg-primary/5 space-y-3">
-              <p className="text-sm font-medium">How much WKC would you like refunded?</p>
+              <p className="text-sm font-medium">Request a refund (in USD)</p>
               <form onSubmit={handleRefund} className="space-y-3">
                 <div>
                   <Input
                     type="number"
-                    step="any"
+                    step="0.01"
                     min="0"
-                    placeholder="Amount in WKC"
+                    placeholder="Amount in USD"
                     value={refundAmount}
                     onChange={(e) => setRefundAmount(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground mt-1">
-                    Current balance:{" "}
+                    Balance:{" "}
                     {balance
                       ? formatTokenAmount(balance.balance, balance.decimals)
                       : "---"}{" "}
                     WKC
                     {balance && wkcPrice > 0 && (
-                      <span className="ml-1">({formatUsd(tokenAmountToUsd(balance.balance, balance.decimals, wkcPrice))})</span>
+                      <span className="ml-1">
+                        ≈ {formatUsd(tokenAmountToUsd(balance.balance, balance.decimals, wkcPrice))}
+                      </span>
                     )}
+                  </p>
+                </div>
+                <div>
+                  <Input
+                    type="text"
+                    placeholder="Destination wallet address (0x...)"
+                    value={refundDestWallet}
+                    onChange={(e) => setRefundDestWallet(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    The wallet address where you want to receive the refund
                   </p>
                 </div>
                 <div className="flex gap-2">
                   <Button
                     type="submit"
                     size="sm"
-                    disabled={!wallet || refundMutation.isPending || !refundAmount}
+                    disabled={!wallet || refundMutation.isPending || !refundAmount || !refundDestWallet.trim()}
                   >
                     {refundMutation.isPending ? "Submitting..." : "Submit Request"}
                   </Button>
@@ -557,6 +585,7 @@ function MyDashboardContent() {
                     onClick={() => {
                       setShowRefundForm(false);
                       setRefundAmount("");
+                      setRefundDestWallet("");
                       setRefundError("");
                       setRefundSuccess("");
                     }}
@@ -588,10 +617,12 @@ function MyDashboardContent() {
                 >
                   <div>
                     <p className="text-sm font-medium">
-                      {formatTokenAmount(r.amount, WKC_DECIMALS)} WKC
+                      {r.amount_usd ? `$${parseFloat(r.amount_usd).toFixed(2)} USD` : `${formatTokenAmount(r.amount, WKC_DECIMALS)} WKC`}
                     </p>
-                    {wkcPrice > 0 && (
-                      <p className="text-xs text-muted-foreground">{formatUsd(tokenAmountToUsd(r.amount, WKC_DECIMALS, wkcPrice))}</p>
+                    {r.destination_wallet && (
+                      <p className="text-xs text-muted-foreground font-mono">
+                        To: <CopyableAddress address={r.destination_wallet} className="text-xs" />
+                      </p>
                     )}
                     <p className="text-xs text-muted-foreground">
                       {new Date(r.created_at).toLocaleDateString()}
@@ -602,26 +633,114 @@ function MyDashboardContent() {
                       </p>
                     )}
                   </div>
-                  <span
-                    className={cn(
-                      "px-2 py-0.5 rounded-full text-xs font-medium",
-                      r.status === "pending" &&
-                        "bg-yellow-500/10 text-yellow-500",
-                      r.status === "approved" &&
-                        "bg-green-500/10 text-green-500",
-                      r.status === "rejected" && "bg-red-500/10 text-red-500",
-                      r.status === "completed" &&
-                        "bg-blue-500/10 text-blue-500",
+                  <div className="flex flex-col items-end gap-1">
+                    {!r.verified && r.status !== "rejected" && (
+                      <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-orange-500/10 text-orange-500">
+                        UNVERIFIED
+                      </span>
                     )}
-                  >
-                    {r.status.toUpperCase()}
-                  </span>
+                    <span
+                      className={cn(
+                        "px-2 py-0.5 rounded-full text-xs font-medium",
+                        r.status === "pending" &&
+                          "bg-yellow-500/10 text-yellow-500",
+                        r.status === "approved" &&
+                          "bg-green-500/10 text-green-500",
+                        r.status === "rejected" && "bg-red-500/10 text-red-500",
+                        r.status === "completed" &&
+                          "bg-blue-500/10 text-blue-500",
+                      )}
+                    >
+                      {r.status.toUpperCase()}
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>
           )}
         </CardContent>
       </Card>
+
+      {/* ── Deposit Detail Modal ──────────────────────────── */}
+      {selectedDeposit && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => setSelectedDeposit(null)}
+        >
+          <div
+            className="w-full max-w-md mx-4 rounded-xl border border-border bg-background shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-border px-5 py-4">
+              <h3 className="text-lg font-semibold">Deposit Details</h3>
+              <button
+                onClick={() => setSelectedDeposit(null)}
+                className="text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="px-5 py-4 space-y-4">
+              <div className="text-center py-2">
+                <p className="text-2xl font-bold">
+                  {formatTokenAmount(selectedDeposit.amount, WKC_DECIMALS)} WKC
+                </p>
+                {wkcPrice > 0 && (
+                  <p className="text-sm text-muted-foreground mt-1">
+                    {formatUsd(tokenAmountToUsd(selectedDeposit.amount, WKC_DECIMALS, wkcPrice))}
+                  </p>
+                )}
+                <span className="inline-block mt-2 px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-500/10 text-green-500">
+                  RECEIVED
+                </span>
+              </div>
+
+              <div className="space-y-3 text-sm">
+                <div className="flex justify-between items-start gap-2">
+                  <span className="text-muted-foreground shrink-0">From</span>
+                  <CopyableAddress address={selectedDeposit.from_address} shorten={false} className="text-xs text-right break-all" />
+                </div>
+                <div className="flex justify-between items-start gap-2">
+                  <span className="text-muted-foreground shrink-0">Token</span>
+                  <CopyableAddress address={selectedDeposit.token_address} shorten={false} className="text-xs text-right break-all" />
+                </div>
+                <div className="flex justify-between items-start gap-2">
+                  <span className="text-muted-foreground shrink-0">Tx Hash</span>
+                  <CopyableAddress address={selectedDeposit.tx_hash} shorten={false} className="text-xs text-right break-all" />
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Chain</span>
+                  <span className="font-medium uppercase">{selectedDeposit.chain}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Block</span>
+                  <span className="font-mono">{selectedDeposit.block_number.toLocaleString()}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Log Index</span>
+                  <span className="font-mono">{selectedDeposit.log_index}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Date</span>
+                  <span>{new Date(selectedDeposit.created_at).toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+            <div className="border-t border-border px-5 py-3">
+              <Button
+                variant="secondary"
+                size="sm"
+                className="w-full"
+                onClick={() => setSelectedDeposit(null)}
+              >
+                Close
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </main>
   );

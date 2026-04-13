@@ -8,8 +8,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn, shortenAddress, formatTokenAmount, tokenAmountToUsd, formatUsd } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import type { AdminRefundRequest } from "@/lib/types";
 
 const WKC_TOKEN_ADDRESS = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
@@ -84,9 +84,6 @@ function AdminRefundsContent() {
     <main className="min-h-screen p-8 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold">Refund Requests</h1>
-        <Link href="/dashboard">
-          <Button variant="secondary">Back to Dashboard</Button>
-        </Link>
       </div>
 
       {/* Filter tabs */}
@@ -128,11 +125,18 @@ function AdminRefundsContent() {
                 <div className="flex-1 space-y-1">
                   <div className="flex items-center gap-3">
                     <p className="font-semibold">
-                      {formatTokenAmount(r.amount, WKC_DECIMALS)} {r.token_symbol}
-                      {wkcPrice > 0 && (
+                      {r.amount_usd
+                        ? `$${parseFloat(r.amount_usd).toFixed(2)} USD`
+                        : `${formatTokenAmount(r.amount, WKC_DECIMALS)} ${r.token_symbol}`}
+                      {!r.amount_usd && wkcPrice > 0 && (
                         <span className="text-sm font-normal text-muted-foreground ml-2">{formatUsd(tokenAmountToUsd(r.amount, WKC_DECIMALS, wkcPrice))}</span>
                       )}
                     </p>
+                    {!r.verified && r.status !== "rejected" && (
+                      <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-orange-500/10 text-orange-500">
+                        UNVERIFIED
+                      </span>
+                    )}
                     <span
                       className={cn(
                         "px-2 py-0.5 rounded-full text-xs font-medium",
@@ -157,7 +161,15 @@ function AdminRefundsContent() {
                     · {r.email}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Wallet: {shortenAddress(r.wallet_id)} · Requested{" "}
+                    Wallet: <CopyableAddress address={r.wallet_address || r.wallet_id} shorten={false} className="text-xs" />
+                  </p>
+                  {r.destination_wallet && (
+                    <p className="text-xs text-muted-foreground">
+                      Destination: <CopyableAddress address={r.destination_wallet} shorten={false} className="text-xs" />
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Requested{" "}
                     {new Date(r.created_at).toLocaleDateString()}{" "}
                     {new Date(r.created_at).toLocaleTimeString()}
                   </p>

@@ -374,15 +374,19 @@ class ApiClient {
   // ── Refund Requests ────────────────────────────────────────
 
   async createRefundRequest(params: {
-    wallet_id: string;
-    amount: string;
-    token_address: string;
-    token_symbol: string;
+    amount_usd: number;
+    destination_wallet: string;
   }): Promise<{ refund_id: string; status: string; message: string }> {
     return this.request("/api/v1/refunds", {
       method: "POST",
       body: JSON.stringify(params),
     });
+  }
+
+  async verifyRefund(token: string): Promise<{ message: string }> {
+    return this.request(
+      `/api/v1/refunds/verify?token=${encodeURIComponent(token)}`,
+    );
   }
 
   async listMyRefundRequests(): Promise<{ refunds: RefundRequest[] }> {

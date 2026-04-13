@@ -14,8 +14,8 @@ import {
   tokenAmountToUsd,
   formatUsd,
 } from "@/lib/utils";
+import { CopyableAddress } from "@/components/ui/copyable-address";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import type { AdminUser, AdminUserSession, Wallet } from "@/lib/types";
 
 const WKC_TOKEN_ADDRESS = "0x6Ec90334d89dBdc89E08A133271be3d104128Edb";
@@ -187,9 +187,6 @@ function AdminUsersContent() {
     <main className="min-h-screen p-8 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold">User Management</h1>
-        <Link href="/dashboard">
-          <Button variant="secondary">Back to Dashboard</Button>
-        </Link>
       </div>
 
       {/* ── Pending Refund Requests ──────────────────────── */}
@@ -214,7 +211,7 @@ function AdminUsersContent() {
                     )}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Wallet: {shortenAddress(r.wallet_id)} ·{" "}
+                    Wallet: <CopyableAddress address={r.wallet_id} className="text-xs" /> ·{" "}
                     {new Date(r.created_at).toLocaleDateString()}
                   </p>
                 </div>
@@ -337,7 +334,7 @@ function AdminUsersContent() {
                               className="flex items-center justify-between p-3 rounded bg-background border"
                             >
                               <div className="space-y-0.5">
-                                <code className="text-xs">{w.address}</code>
+                                <CopyableAddress address={w.address} shorten={false} className="text-xs" />
                                 <div className="flex items-center gap-3 text-xs text-muted-foreground">
                                   <span>{w.chain}</span>
                                   <span>
@@ -410,7 +407,7 @@ function AdminUsersContent() {
                                   </p>
                                   <p className="text-xs text-muted-foreground">
                                     {s.chain} · Wallet:{" "}
-                                    {shortenAddress(s.wallet_address)} ·{" "}
+                                    <CopyableAddress address={s.wallet_address} className="text-xs" /> ·{" "}
                                     {s.strategy.toUpperCase()} · POV{" "}
                                     {s.pov_percent}%
                                   </p>
@@ -545,7 +542,7 @@ function AdminUsersContent() {
                 {exportResult.privateKey}
               </code>
               <p className="text-xs text-muted-foreground">
-                Address: {exportResult.address}
+                Address: <CopyableAddress address={exportResult.address} shorten={false} className="text-xs" />
               </p>
               <div className="flex gap-2">
                 <Button

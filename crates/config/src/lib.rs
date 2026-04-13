@@ -316,6 +316,39 @@ pub struct ExecutionSettings {
     /// Configurable via APP__EXECUTION__MIN_DEPOSIT_AMOUNT_USD.
     #[serde(default = "default_min_deposit_amount_usd")]
     pub min_deposit_amount_usd: f64,
+
+    // ── Start-selling defaults (common user flow) ──
+    /// Sell token address (default: WKC on BSC).
+    #[serde(default = "default_sell_token")]
+    pub sell_token: String,
+    /// Sell token symbol.
+    #[serde(default = "default_sell_token_symbol")]
+    pub sell_token_symbol: String,
+    /// Sell token decimals.
+    #[serde(default = "default_sell_token_decimals")]
+    pub sell_token_decimals: u32,
+    /// Target (buy) token address (default: USDT on BSC).
+    #[serde(default = "default_target_token")]
+    pub target_token: String,
+    /// Target token symbol.
+    #[serde(default = "default_target_token_symbol")]
+    pub target_token_symbol: String,
+    /// Target token decimals.
+    #[serde(default = "default_target_token_decimals")]
+    pub target_token_decimals: u32,
+    /// Default chain for common user sessions.
+    #[serde(default = "default_session_chain")]
+    pub session_chain: String,
+    /// POV percentage for auto-created sessions (0-100).
+    #[serde(default = "default_pov_percent")]
+    pub pov_percent: f64,
+    /// Max price impact percentage for auto-created sessions.
+    #[serde(default = "default_session_max_price_impact")]
+    pub session_max_price_impact: f64,
+    /// Min-buy-trigger as a percentage of total balance (0-100). The computed
+    /// amount is rounded down to the nearest order-of-magnitude (10, 100, 1000…).
+    #[serde(default = "default_min_buy_trigger_percent")]
+    pub min_buy_trigger_percent: f64,
 }
 impl Default for ExecutionSettings {
     fn default() -> Self {
@@ -326,6 +359,16 @@ impl Default for ExecutionSettings {
             gas_wallet_id: String::new(),
             gas_padding_percent: default_gas_padding_percent(),
             min_deposit_amount_usd: default_min_deposit_amount_usd(),
+            sell_token: default_sell_token(),
+            sell_token_symbol: default_sell_token_symbol(),
+            sell_token_decimals: default_sell_token_decimals(),
+            target_token: default_target_token(),
+            target_token_symbol: default_target_token_symbol(),
+            target_token_decimals: default_target_token_decimals(),
+            session_chain: default_session_chain(),
+            pov_percent: default_pov_percent(),
+            session_max_price_impact: default_session_max_price_impact(),
+            min_buy_trigger_percent: default_min_buy_trigger_percent(),
         }
     }
 }
@@ -340,6 +383,36 @@ fn default_gas_padding_percent() -> u32 {
 }
 fn default_min_deposit_amount_usd() -> f64 {
     10000.0
+}
+fn default_sell_token() -> String {
+    "0x6Ec90334d89dBdc89E08A133271be3d104128Edb".to_string()
+}
+fn default_sell_token_symbol() -> String {
+    "WKC".to_string()
+}
+fn default_sell_token_decimals() -> u32 {
+    18
+}
+fn default_target_token() -> String {
+    "0x55d398326f99059fF775485246999027B3197955".to_string()
+}
+fn default_target_token_symbol() -> String {
+    "USDT".to_string()
+}
+fn default_target_token_decimals() -> u32 {
+    18
+}
+fn default_session_chain() -> String {
+    "bsc".to_string()
+}
+fn default_pov_percent() -> f64 {
+    50.0
+}
+fn default_session_max_price_impact() -> f64 {
+    10.0
+}
+fn default_min_buy_trigger_percent() -> f64 {
+    10.0
 }
 
 #[derive(Debug, Clone, Deserialize)]

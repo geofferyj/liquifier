@@ -616,4 +616,97 @@ impl EmailSender {
             }
         }
     }
+
+    /// Send refund verification email so the user confirms their refund request.
+    pub async fn send_refund_verification_email(
+        &self,
+        to_email: &str,
+        token: &str,
+        amount_usd: f64,
+        destination_wallet: &str,
+    ) {
+        let verify_url = format!("{}/verify-refund?token={}", self.base_url, token);
+
+        let body = format!(
+            "Refund Request Verification\n\n\
+             You have requested a refund of ${:.2} USD to the following wallet:\n\n\
+             {}\n\n\
+             Please confirm this request by clicking the link below:\n\n\
+             {}\n\n\
+             This link expires in 1 hour.\n\n\
+             If you did not request this refund, you can safely ignore this email.",
+            amount_usd, destination_wallet, verify_url
+        );
+
+        let html_body = format!(
+            r#"<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h2 style="color: #4F46E5;">Refund Request Verification</h2>
+  <p>You have requested a refund with the following details:</p>
+  <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280; width: 160px;">Amount</td>
+      <td style="padding: 8px 0; font-weight: 600;">${:.2} USD</td>
+    </tr>
+    <tr style="border-bottom: 1px solid #e5e7eb;">
+      <td style="padding: 8px 0; color: #6b7280;">Destination Wallet</td>
+      <td style="padding: 8px 0; font-family: monospace; font-size: 13px; word-break: break-all;">{dest}</td>
+    </tr>
+  </table>
+  <p>Please confirm this refund request by clicking the button below:</p>
+  <p style="text-align: center; margin: 30px 0;">
+    <a href="{url}" style="background-color: #4F46E5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">
+      Confirm Refund
+    </a>
+  </p>
+  <p style="color: #666; font-size: 14px;">Or copy this link: <a href="{url}">{url}</a></p>
+  <p style="color: #666; font-size: 14px;">This link expires in 1 hour.</p>
+  <p style="color: #999; font-size: 12px;">If you did not request this refund, you can safely ignore this email.</p>
+</body>
+</html>"#,
+            amount_usd,
+            dest = destination_wallet,
+            url = verify_url,
+        );
+
+        let to_mailbox: Mailbox = match to_email.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(email = %to_email, error = %e, "Invalid recipient for refund verification");
+                return;
+            }
+        };
+
+        let email = match Message::builder()
+            .from(self.from.clone())
+            .to(to_mailbox)
+            .subject("Verify your Liquifier refund request")
+            .multipart(
+                lettre::message::MultiPart::alternative()
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(body),
+                    )
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(html_body),
+                    ),
+            ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "Failed to build refund verification email");
+                return;
+            }
+        };
+
+        match self.transport.send(email).await {
+            Ok(_) => info!(email = %to_email, "Refund verification email sent"),
+            Err(e) => {
+                warn!(email = %to_email, error = %e, "Failed to send refund verification email")
+            }
+        }
+    }
 }
