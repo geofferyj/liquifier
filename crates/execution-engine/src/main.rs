@@ -208,6 +208,13 @@ async fn main() -> Result<()> {
         buy_trigger_oracle,
     });
 
+    {
+        let reconcile_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            reconcile_submitted_trades_loop(reconcile_state).await;
+        });
+    }
+
     info!("Execution Engine worker starting — subscribing to DEX swap events");
 
     // Subscribe to the DEX_SWAPS stream as a durable consumer
@@ -1383,6 +1390,120 @@ struct TradeFinalization {
     received_amount: Option<String>,
 }
 
+struct PendingTradeForReconciliation {
+    trade_id: String,
+    session_id: String,
+    chain: String,
+    wallet_id: String,
+    target_token: String,
+    sell_tx_hash: String,
+}
+
+async fn reconcile_submitted_trades_loop(state: Arc<EngineState>) {
+    loop {
+        if let Err(e) = reconcile_submitted_trades_once(&state).await {
+            warn!(error = %e, "Submitted-trade reconciliation pass failed");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+    }
+}
+
+async fn reconcile_submitted_trades_once(state: &EngineState) -> Result<()> {
+    let pending = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+        r#"
+        SELECT
+            t.id::text,
+            t.session_id::text,
+            s.chain::text,
+            s.wallet_id::text,
+            s.target_token,
+            t.sell_tx_hash
+        FROM trades t
+        INNER JOIN sessions s ON s.id = t.session_id
+        WHERE t.status = 'submitted'
+          AND t.sell_tx_hash IS NOT NULL
+          AND t.sell_tx_hash <> ''
+        ORDER BY COALESCE(t.executed_at, t.created_at) ASC
+        LIMIT 25
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .context("Failed to query submitted trades for reconciliation")?
+    .into_iter()
+    .map(
+        |(trade_id, session_id, chain, wallet_id, target_token, sell_tx_hash)| {
+            PendingTradeForReconciliation {
+                trade_id,
+                session_id,
+                chain,
+                wallet_id,
+                target_token,
+                sell_tx_hash,
+            }
+        },
+    )
+    .collect::<Vec<_>>();
+
+    for trade in pending {
+        let recipient =
+            match resolve_session_wallet_address(&state.db, &trade.wallet_id, &trade.chain).await {
+                Ok(recipient) => recipient,
+                Err(e) => {
+                    warn!(
+                        trade_id = %trade.trade_id,
+                        session_id = %trade.session_id,
+                        error = %e,
+                        "Skipping submitted trade reconciliation: failed to resolve recipient"
+                    );
+                    continue;
+                }
+            };
+
+        match fetch_receipt_with_received(
+            &trade.chain,
+            &trade.sell_tx_hash,
+            &trade.target_token,
+            recipient,
+        )
+        .await
+        {
+            Ok(Some((true, received))) => {
+                mark_trade_confirmed(&state.db, &trade.trade_id).await?;
+                if let Some(ref amount) = received {
+                    update_trade_received(&state.db, &trade.trade_id, amount, &trade.target_token)
+                        .await?;
+                }
+                info!(
+                    trade_id = %trade.trade_id,
+                    session_id = %trade.session_id,
+                    received_amount = ?received,
+                    "Reconciled submitted trade as confirmed"
+                );
+            }
+            Ok(Some((false, _))) => {
+                mark_trade_failed(&state.db, &trade.trade_id, "transaction_reverted").await?;
+                info!(
+                    trade_id = %trade.trade_id,
+                    session_id = %trade.session_id,
+                    "Reconciled submitted trade as failed"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    trade_id = %trade.trade_id,
+                    session_id = %trade.session_id,
+                    error = %e,
+                    "Failed to reconcile submitted trade receipt"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn record_trade(
     db: &PgPool,
     session: &SessionInfo,
@@ -1487,41 +1608,49 @@ async fn finalize_trade_status_from_receipt(
         });
     };
 
-    match fetch_receipt_with_received(chain, tx_hash, target_token, recipient).await {
-        Ok(Some((true, received))) => {
-            mark_trade_confirmed(db, trade_id).await?;
-            // Store actual received amount in final_received / final_token
-            if let Some(ref amount) = received {
-                update_trade_received(db, trade_id, amount, target_token).await?;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+    loop {
+        match fetch_receipt_with_received(chain, tx_hash, target_token, recipient).await {
+            Ok(Some((true, received))) => {
+                mark_trade_confirmed(db, trade_id).await?;
+                // Store actual received amount in final_received / final_token.
+                if let Some(ref amount) = received {
+                    update_trade_received(db, trade_id, amount, target_token).await?;
+                }
+                return Ok(TradeFinalization {
+                    status: "confirmed".to_string(),
+                    failure_reason: None,
+                    received_amount: received,
+                });
             }
-            Ok(TradeFinalization {
-                status: "confirmed".to_string(),
-                failure_reason: None,
-                received_amount: received,
-            })
-        }
-        Ok(Some((false, _))) => {
-            let reason = "transaction_reverted".to_string();
-            mark_trade_failed(db, trade_id, &reason).await?;
-            Ok(TradeFinalization {
-                status: "failed".to_string(),
-                failure_reason: Some(reason),
-                received_amount: None,
-            })
-        }
-        Ok(None) => Ok(TradeFinalization {
-            status: "submitted".to_string(),
-            failure_reason: None,
-            received_amount: None,
-        }),
-        Err(e) => {
-            let reason = format!("receipt_lookup_error: {e}");
-            mark_trade_failed(db, trade_id, &reason).await?;
-            Ok(TradeFinalization {
-                status: "failed".to_string(),
-                failure_reason: Some(reason),
-                received_amount: None,
-            })
+            Ok(Some((false, _))) => {
+                let reason = "transaction_reverted".to_string();
+                mark_trade_failed(db, trade_id, &reason).await?;
+                return Ok(TradeFinalization {
+                    status: "failed".to_string(),
+                    failure_reason: Some(reason),
+                    received_amount: None,
+                });
+            }
+            Ok(None) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(TradeFinalization {
+                        status: "submitted".to_string(),
+                        failure_reason: None,
+                        received_amount: None,
+                    });
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                let reason = format!("receipt_lookup_error: {e}");
+                mark_trade_failed(db, trade_id, &reason).await?;
+                return Ok(TradeFinalization {
+                    status: "failed".to_string(),
+                    failure_reason: Some(reason),
+                    received_amount: None,
+                });
+            }
         }
     }
 }

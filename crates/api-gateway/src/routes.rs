@@ -1624,13 +1624,13 @@ pub async fn get_session_trades(
 
     let total_received_raw = sqlx::query_scalar::<_, String>(
         r#"
-        SELECT COALESCE(SUM(COALESCE(t.final_received, t.trigger_buy_amount))::text, '0')
-        FROM trades t
-        INNER JOIN sessions s ON s.id = t.session_id
-        WHERE t.session_id = $1
-          AND ($2::boolean OR s.user_id = $3)
-          AND t.status = 'confirmed'
-        "#,
+                SELECT COALESCE(SUM(t.final_received)::text, '0')
+                FROM trades t
+                INNER JOIN sessions s ON s.id = t.session_id
+                WHERE t.session_id = $1
+                    AND ($2::boolean OR s.user_id = $3)
+                    AND t.status = 'confirmed'
+                "#,
     )
     .bind(session_id)
     .bind(user.role == "admin")
@@ -1647,7 +1647,7 @@ pub async fn get_session_trades(
             t.chain::text AS chain,
             t.status::text AS status,
             t.sell_amount::text AS sell_amount,
-            COALESCE(t.final_received, t.trigger_buy_amount)::text AS received_amount,
+            COALESCE(t.final_received, 0)::text AS received_amount,
             COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
             COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
             t.failure_reason AS failure_reason,
@@ -1702,13 +1702,13 @@ pub async fn get_public_session_trades(
 
     let total_received_raw = sqlx::query_scalar::<_, String>(
         r#"
-        SELECT COALESCE(SUM(COALESCE(t.final_received, t.trigger_buy_amount))::text, '0')
-        FROM trades t
-        INNER JOIN sessions s ON s.id = t.session_id
-        WHERE s.public_slug = $1
-          AND s.public_sharing_enabled = TRUE
-          AND t.status = 'confirmed'
-        "#,
+                SELECT COALESCE(SUM(t.final_received)::text, '0')
+                FROM trades t
+                INNER JOIN sessions s ON s.id = t.session_id
+                WHERE s.public_slug = $1
+                    AND s.public_sharing_enabled = TRUE
+                    AND t.status = 'confirmed'
+                "#,
     )
     .bind(&slug)
     .fetch_one(&state.db)
@@ -1723,7 +1723,7 @@ pub async fn get_public_session_trades(
             t.chain::text AS chain,
             t.status::text AS status,
             t.sell_amount::text AS sell_amount,
-            COALESCE(t.final_received, t.trigger_buy_amount)::text AS received_amount,
+            COALESCE(t.final_received, 0)::text AS received_amount,
             COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
             COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
             t.failure_reason AS failure_reason,
