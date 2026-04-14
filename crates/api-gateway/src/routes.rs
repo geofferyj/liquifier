@@ -1,9 +1,10 @@
 use alloy::{
     network::TransactionBuilder,
-    primitives::{Address, U256},
+    primitives::{Address, Bytes, U256},
     providers::{Provider, ProviderBuilder},
-    rpc::types::TransactionRequest,
+    rpc::types::{TransactionInput, TransactionRequest},
     sol,
+    sol_types::SolCall,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -190,6 +191,14 @@ pub struct GetBalanceQuery {
     pub rpc_url: String,
 }
 
+#[derive(Deserialize)]
+pub struct AdminWithdrawBody {
+    pub destination_wallet: String,
+    /// Raw token amount in wei. If omitted, withdraws entire on-chain balance.
+    pub amount: Option<String>,
+    pub totp_code: String,
+}
+
 fn default_trades_limit() -> i64 {
     50
 }
@@ -222,6 +231,14 @@ pub struct TokenUsdPriceResponse {
 struct CachedOraclePool {
     pool_address: String,
     version: u8,
+}
+
+sol! {
+    #[sol(rpc)]
+    interface IWithdrawERC20 {
+        function transfer(address to, uint256 amount) external returns (bool);
+        function balanceOf(address account) external view returns (uint256);
+    }
 }
 
 sol! {
@@ -3277,4 +3294,224 @@ pub async fn admin_list_all_wallets(
         .collect();
 
     Ok(Json(serde_json::json!({ "wallets": wallets })))
+}
+
+/// Admin: withdraw (transfer) the session wallet's target token to a destination address.
+/// Requires admin role + valid TOTP code.
+pub async fn admin_withdraw_session(
+    State(state): State<SharedState>,
+    Extension(user): Extension<AuthUser>,
+    Path(session_id): Path<String>,
+    Json(body): Json<AdminWithdrawBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: &str| (status, Json(serde_json::json!({ "error": msg })));
+
+    // 1. Admin check
+    if user.role != "admin" {
+        return Err(err(StatusCode::FORBIDDEN, "Admin access required"));
+    }
+
+    // 2. TOTP verification
+    let row = sqlx::query("SELECT totp_enabled, totp_secret FROM users WHERE id = $1")
+        .bind(user.user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "DB error"))?;
+
+    let totp_enabled: bool = row.get("totp_enabled");
+    if !totp_enabled {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "TOTP not configured for this admin",
+        ));
+    }
+
+    let totp_secret: Vec<u8> = row.get("totp_secret");
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, totp_secret, None, String::new())
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "TOTP init error"))?;
+
+    if !totp
+        .check_current(&body.totp_code)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "TOTP check error"))?
+    {
+        return Err(err(StatusCode::UNAUTHORIZED, "Invalid TOTP code"));
+    }
+
+    // 3. Validate destination address
+    let dest_addr: Address = body.destination_wallet.parse().map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "Invalid destination wallet address",
+        )
+    })?;
+
+    // 4. Fetch session
+    let mut session_client = SessionServiceClient::connect(state.session_addr.clone())
+        .await
+        .map_err(|_| {
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session service unavailable",
+            )
+        })?;
+
+    let session = session_client
+        .get_session(GetSessionRequest {
+            session_id: session_id.clone(),
+        })
+        .await
+        .map_err(|_| err(StatusCode::NOT_FOUND, "Session not found"))?
+        .into_inner();
+
+    // 5. Get chain config
+    let cfg = liquifier_config::Settings::global();
+    let chain = &session.chain;
+    let chain_cfg = cfg
+        .chains
+        .get(chain)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "Unknown chain"))?;
+    let rpc_url_str = chain_cfg.rpc_url.trim();
+    let chain_id = chain_cfg.chain_id;
+
+    // 6. Get session wallet address
+    let wallet_address: String =
+        sqlx::query_scalar("SELECT address FROM wallets WHERE id = $1::uuid")
+            .bind(&session.wallet_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Wallet not found"))?;
+
+    let wallet_addr: Address = wallet_address.parse().map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid wallet address in DB",
+        )
+    })?;
+
+    // 7. Connect to RPC and fetch on-chain token balance
+    let rpc_url: alloy::transports::http::reqwest::Url = rpc_url_str
+        .parse()
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Invalid RPC URL"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+    let token_address: Address = session.target_token.parse().map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid target token address",
+        )
+    })?;
+
+    let erc20 = IWithdrawERC20::new(token_address, &provider);
+    let on_chain_balance = erc20.balanceOf(wallet_addr).call().await.map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to fetch token balance",
+        )
+    })?;
+
+    if on_chain_balance.is_zero() {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "No token balance in session wallet",
+        ));
+    }
+
+    // 8. Determine withdrawal amount
+    let amount = if let Some(amt_str) = body.amount {
+        let amt = U256::from_str_radix(&amt_str, 10)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid amount"))?;
+        if amt.is_zero() {
+            return Err(err(StatusCode::BAD_REQUEST, "Amount must be non-zero"));
+        }
+        if amt > on_chain_balance {
+            return Err(err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Amount exceeds on-chain balance",
+            ));
+        }
+        amt
+    } else {
+        on_chain_balance
+    };
+
+    // 9. Build ERC20 transfer calldata
+    let transfer_call = IWithdrawERC20::transferCall {
+        to: dest_addr,
+        amount,
+    };
+    let calldata = transfer_call.abi_encode();
+
+    // 10. Build, sign, and submit transaction
+    let nonce = provider
+        .get_transaction_count(wallet_addr)
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch nonce"))?;
+
+    let gas_price = provider.get_gas_price().await.map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to fetch gas price",
+        )
+    })?;
+
+    let tx = TransactionRequest::default()
+        .from(wallet_addr)
+        .to(token_address)
+        .value(U256::ZERO)
+        .input(TransactionInput::new(Bytes::from(calldata)))
+        .nonce(nonce)
+        .with_chain_id(chain_id)
+        .gas_limit(80_000u64)
+        .gas_price(gas_price);
+
+    let unsigned_bytes = serde_json::to_vec(&tx)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize tx"))?;
+
+    let mut kms = WalletKmsClient::connect(state.kms_addr.clone())
+        .await
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "KMS unavailable"))?;
+
+    let sign_resp = kms
+        .sign_transaction(SignTransactionRequest {
+            wallet_id: session.wallet_id.clone(),
+            unsigned_tx: unsigned_bytes,
+            chain_id,
+        })
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "KMS signing failed"))?
+        .into_inner();
+
+    if sign_resp.signed_tx.is_empty() {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "KMS returned empty signed tx",
+        ));
+    }
+
+    let pending = provider
+        .send_raw_transaction(&sign_resp.signed_tx)
+        .await
+        .map_err(|_| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to broadcast transaction",
+            )
+        })?;
+
+    let tx_hash = format!("{:?}", pending.tx_hash());
+
+    info!(
+        session_id = %session_id,
+        tx_hash = %tx_hash,
+        amount = %amount,
+        destination = %body.destination_wallet,
+        "Admin withdrawal submitted"
+    );
+
+    Ok(Json(serde_json::json!({
+        "tx_hash": tx_hash,
+        "amount": amount.to_string(),
+        "destination_wallet": body.destination_wallet,
+        "token_address": session.target_token,
+    })))
 }

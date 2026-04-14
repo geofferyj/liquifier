@@ -489,6 +489,25 @@ class ApiClient {
   }> {
     return this.request("/api/v1/admin/wallets");
   }
+
+  async adminWithdrawSession(
+    sessionId: string,
+    params: {
+      destination_wallet: string;
+      amount?: string; // raw wei amount; omit to withdraw all
+      totp_code: string;
+    },
+  ): Promise<{
+    tx_hash: string;
+    amount: string;
+    destination_wallet: string;
+    token_address: string;
+  }> {
+    return this.request(`/api/v1/admin/sessions/${sessionId}/withdraw`, {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
 }
 
 export const api = new ApiClient();

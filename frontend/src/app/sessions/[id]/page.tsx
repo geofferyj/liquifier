@@ -272,6 +272,14 @@ export default function SessionDashboardPage() {
               Cancel
             </Button>
           )}
+          {role === "admin" && status === "completed" && (
+            <Button
+              variant="default"
+              onClick={() => router.push(`/sessions/${sessionId}/withdraw`)}
+            >
+              Withdraw
+            </Button>
+          )}
         </div>
       </div>
 

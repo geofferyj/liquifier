@@ -196,6 +196,10 @@ async fn main() -> Result<()> {
             put(routes::admin_update_user_role),
         )
         .route("/api/v1/admin/wallets", get(routes::admin_list_all_wallets))
+        .route(
+            "/api/v1/admin/sessions/{session_id}/withdraw",
+            post(routes::admin_withdraw_session),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             jwt_middleware::require_auth,
