@@ -96,11 +96,11 @@ impl SessionService for SessionServiceImpl {
                 id, user_id, wallet_id, chain, sell_token, sell_token_symbol,
                 sell_token_decimals, target_token, target_token_symbol,
                 target_token_decimals, strategy, total_amount, pov_percent,
-                max_price_impact, min_buy_trigger_usd, swap_path, public_slug
+                max_price_impact, min_buy_trigger_usd, min_market_cap_usd, swap_path, public_slug
             )
             VALUES (
                 $1, $2, $3, $4::chain_id, $5, $6, $7, $8, $9, $10,
-                $11::strategy_type, $12::numeric, $13, $14, $15, $16, $17
+                $11::strategy_type, $12::numeric, $13, $14, $15, $16, $17, $18
             )
             RETURNING id, created_at, updated_at
             "#,
@@ -120,6 +120,7 @@ impl SessionService for SessionServiceImpl {
         .bind(req.pov_percent)
         .bind(req.max_price_impact)
         .bind(req.min_buy_trigger_usd)
+        .bind(req.min_market_cap_usd)
         .bind(if req.swap_path_json.is_empty() {
             None
         } else {
@@ -178,6 +179,7 @@ impl SessionService for SessionServiceImpl {
             pov_percent: req.pov_percent,
             max_price_impact: req.max_price_impact,
             min_buy_trigger_usd: req.min_buy_trigger_usd,
+            min_market_cap_usd: req.min_market_cap_usd,
             swap_path_json: req.swap_path_json,
             public_slug: slug,
             public_sharing_enabled: true,
@@ -223,7 +225,7 @@ impl SessionService for SessionServiceImpl {
                        sell_token, sell_token_symbol, sell_token_decimals,
                        target_token, target_token_symbol, target_token_decimals,
                        strategy::text, total_amount::text, amount_sold::text,
-                       pov_percent, max_price_impact, min_buy_trigger_usd,
+                      pov_percent, max_price_impact, min_buy_trigger_usd, min_market_cap_usd,
                        swap_path, public_slug, public_sharing_enabled, created_at, updated_at
                 FROM sessions
                 ORDER BY created_at DESC
@@ -243,7 +245,7 @@ impl SessionService for SessionServiceImpl {
                        sell_token, sell_token_symbol, sell_token_decimals,
                        target_token, target_token_symbol, target_token_decimals,
                        strategy::text, total_amount::text, amount_sold::text,
-                       pov_percent, max_price_impact, min_buy_trigger_usd,
+                      pov_percent, max_price_impact, min_buy_trigger_usd, min_market_cap_usd,
                        swap_path, public_slug, public_sharing_enabled, created_at, updated_at
                 FROM sessions
                 WHERE user_id = $1
@@ -449,7 +451,7 @@ impl SessionService for SessionServiceImpl {
                        s.sell_token, s.sell_token_symbol, s.sell_token_decimals,
                        s.target_token, s.target_token_symbol, s.target_token_decimals,
                        s.strategy::text, s.total_amount::text, s.amount_sold::text,
-                       s.pov_percent, s.max_price_impact, s.min_buy_trigger_usd,
+                      s.pov_percent, s.max_price_impact, s.min_buy_trigger_usd, s.min_market_cap_usd,
                        s.swap_path, s.public_slug, s.public_sharing_enabled, s.created_at, s.updated_at
                 FROM sessions s
                 INNER JOIN session_pools sp ON sp.session_id = s.id
@@ -471,7 +473,7 @@ impl SessionService for SessionServiceImpl {
                        sell_token, sell_token_symbol, sell_token_decimals,
                        target_token, target_token_symbol, target_token_decimals,
                        strategy::text, total_amount::text, amount_sold::text,
-                       pov_percent, max_price_impact, min_buy_trigger_usd,
+                      pov_percent, max_price_impact, min_buy_trigger_usd, min_market_cap_usd,
                        swap_path, public_slug, public_sharing_enabled, created_at, updated_at
                 FROM sessions
                 WHERE chain = $1::chain_id
@@ -550,13 +552,14 @@ impl SessionService for SessionServiceImpl {
         sqlx::query(
             r#"
             UPDATE sessions
-            SET pov_percent = $1, max_price_impact = $2, min_buy_trigger_usd = $3, updated_at = NOW()
-            WHERE id = $4
+            SET pov_percent = $1, max_price_impact = $2, min_buy_trigger_usd = $3, min_market_cap_usd = $4, updated_at = NOW()
+            WHERE id = $5
             "#,
         )
         .bind(req.pov_percent)
         .bind(req.max_price_impact)
         .bind(req.min_buy_trigger_usd)
+        .bind(req.min_market_cap_usd)
         .bind(session_id)
         .execute(&self.db)
         .await
@@ -615,7 +618,7 @@ impl SessionService for SessionServiceImpl {
                    sell_token, sell_token_symbol, sell_token_decimals,
                    target_token, target_token_symbol, target_token_decimals,
                    strategy::text, total_amount::text, amount_sold::text,
-                   pov_percent, max_price_impact, min_buy_trigger_usd,
+                     pov_percent, max_price_impact, min_buy_trigger_usd, min_market_cap_usd,
                    swap_path, public_slug, public_sharing_enabled, created_at, updated_at
             FROM sessions
             WHERE public_slug = $1 AND public_sharing_enabled = TRUE
@@ -833,7 +836,7 @@ async fn fetch_session(db: &PgPool, session_id: Uuid) -> Result<Option<SessionIn
                sell_token, sell_token_symbol, sell_token_decimals,
                target_token, target_token_symbol, target_token_decimals,
                strategy::text, total_amount::text, amount_sold::text,
-               pov_percent, max_price_impact, min_buy_trigger_usd,
+             pov_percent, max_price_impact, min_buy_trigger_usd, min_market_cap_usd,
                swap_path, public_slug, public_sharing_enabled, created_at, updated_at
         FROM sessions
         WHERE id = $1
@@ -858,6 +861,7 @@ fn row_to_session_info(row: &sqlx::postgres::PgRow) -> SessionInfo {
     let pov_percent: sqlx::types::BigDecimal = row.get("pov_percent");
     let max_price_impact: sqlx::types::BigDecimal = row.get("max_price_impact");
     let min_buy_trigger_usd: sqlx::types::BigDecimal = row.get("min_buy_trigger_usd");
+    let min_market_cap_usd: sqlx::types::BigDecimal = row.get("min_market_cap_usd");
 
     SessionInfo {
         session_id: id.to_string(),
@@ -877,6 +881,7 @@ fn row_to_session_info(row: &sqlx::postgres::PgRow) -> SessionInfo {
         pov_percent: pov_percent.to_string().parse().unwrap_or(10.0),
         max_price_impact: max_price_impact.to_string().parse().unwrap_or(1.0),
         min_buy_trigger_usd: min_buy_trigger_usd.to_string().parse().unwrap_or(100.0),
+        min_market_cap_usd: min_market_cap_usd.to_string().parse().unwrap_or(0.0),
         swap_path_json: swap_path.map(|v| v.to_string()).unwrap_or_default(),
         public_slug: public_slug.unwrap_or_default(),
         public_sharing_enabled,

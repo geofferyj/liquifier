@@ -58,6 +58,7 @@ sol! {
         function approve(address spender, uint256 amount) external returns (bool);
         function allowance(address owner, address spender) external view returns (uint256);
         function balanceOf(address account) external view returns (uint256);
+        function totalSupply() external view returns (uint256);
         function transfer(address to, uint256 amount) external returns (bool);
     }
 }
@@ -411,6 +412,67 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             }
         }
 
+        // 2b. Market-cap snapshot + optional guard at execution time.
+        // Uses on-chain totalSupply and oracle USD price for the sell token.
+        let market_cap_usd = match fetch_token_market_cap_usd_from_oracle(
+            &session.chain,
+            state.buy_trigger_oracle,
+            resolved_token_out,
+            &event.pool_address,
+            pool_type_to_oracle_version(pool_type),
+            session.sell_token_decimals,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(e) => {
+                if session.min_market_cap_usd > 0.0 {
+                    warn!(
+                        session_id = %session.session_id,
+                        block_number = event.block_number,
+                        token = %resolved_token_out,
+                        error = %e,
+                        "Skipping trade: failed to fetch market cap while threshold is enabled"
+                    );
+                    continue;
+                }
+
+                warn!(
+                    session_id = %session.session_id,
+                    block_number = event.block_number,
+                    token = %resolved_token_out,
+                    error = %e,
+                    "Proceeding without market cap snapshot"
+                );
+                None
+            }
+        };
+
+        if session.min_market_cap_usd > 0.0 {
+            match market_cap_usd {
+                Some(cap_usd) if cap_usd >= session.min_market_cap_usd => {}
+                Some(cap_usd) => {
+                    info!(
+                        session_id = %session.session_id,
+                        block_number = event.block_number,
+                        market_cap_usd = cap_usd,
+                        min_market_cap_usd = session.min_market_cap_usd,
+                        "Skipping trade: market cap below configured threshold"
+                    );
+                    continue;
+                }
+                None => {
+                    warn!(
+                        session_id = %session.session_id,
+                        block_number = event.block_number,
+                        min_market_cap_usd = session.min_market_cap_usd,
+                        "Skipping trade: market cap unavailable while threshold is enabled"
+                    );
+                    continue;
+                }
+            }
+        }
+
         // 3. Calculate our sell amount = buy_amount * (pov_percent / 100)
         let pov_bps = (session.pov_percent * 100.0) as u64; // convert % to basis points
         let sell_amount = (buy_amount * U256::from(pov_bps)) / U256::from(10_000);
@@ -678,6 +740,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             &event,
             sell_amount,
             price_impact_bps,
+            market_cap_usd,
             sell_tx_hash.as_deref(),
         )
         .await?;
@@ -743,6 +806,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
             "received_amount": received_amount,
             "tx_hash": tx_hash,
             "price_impact_bps": price_impact_bps,
+            "market_cap_usd": market_cap_usd.map(|value| format!("{value:.2}")),
             "executed_at": recorded_trade.executed_at,
             "status": finalization.status,
             "failure_reason": finalization.failure_reason,
@@ -1510,20 +1574,24 @@ async fn record_trade(
     event: &DexSwapEvent,
     sell_amount: U256,
     price_impact_bps: u32,
+    market_cap_usd: Option<f64>,
     sell_tx_hash: Option<&str>,
 ) -> Result<RecordedTrade> {
     let session_id: uuid::Uuid = session.session_id.parse()?;
     let trigger_buy_amount = parse_numeric_decimal(&event.amount_out, "trigger_buy_amount")?;
     let sell_amount_decimal = parse_numeric_decimal(&sell_amount.to_string(), "sell_amount")?;
+    let market_cap_usd_decimal = market_cap_usd
+        .map(|value| parse_numeric_decimal(&format!("{value:.2}"), "market_cap_usd"))
+        .transpose()?;
 
     let inserted = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
         r#"
         INSERT INTO trades (
             session_id, chain, status, trigger_tx_hash, trigger_pool,
             trigger_log_index, trigger_buy_amount, sell_amount, sell_tx_hash,
-            sell_pool, price_impact_bps, executed_at
+            sell_pool, price_impact_bps, market_cap_usd, executed_at
         )
-        VALUES ($1, $2::chain_id, 'submitted', $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        VALUES ($1, $2::chain_id, 'submitted', $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
         ON CONFLICT (session_id, trigger_tx_hash, trigger_pool, trigger_log_index) DO NOTHING
         RETURNING id::text, executed_at
         "#,
@@ -1538,6 +1606,7 @@ async fn record_trade(
     .bind(sell_tx_hash)
     .bind(&event.pool_address)
     .bind(price_impact_bps as i32)
+    .bind(market_cap_usd_decimal)
     .fetch_optional(db)
     .await
     .context("Failed to record trade")?;
@@ -2236,6 +2305,77 @@ async fn fetch_buy_amount_usd_from_oracle(
         .with_context(|| format!("Invalid RPC URL for chain {chain}"))?;
     let provider = ProviderBuilder::new().connect_http(rpc_url);
 
+    let quote = fetch_oracle_usd_price_36(
+        &provider,
+        oracle_address,
+        token_address,
+        pair_address,
+        version,
+    )
+    .await?;
+
+    Ok(usd_value_from_oracle_price_36(
+        amount_raw,
+        token_decimals,
+        quote,
+    ))
+}
+
+async fn fetch_token_market_cap_usd_from_oracle(
+    chain: &str,
+    oracle_address: Address,
+    token_address: &str,
+    pair_address: &str,
+    version: u8,
+    token_decimals: u32,
+) -> Result<Option<f64>> {
+    let rpc_url = chain_rpc_url(chain)?;
+    let rpc_url: alloy::transports::http::reqwest::Url = rpc_url
+        .parse()
+        .with_context(|| format!("Invalid RPC URL for chain {chain}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+    let usd_price_36 = fetch_oracle_usd_price_36(
+        &provider,
+        oracle_address,
+        token_address,
+        pair_address,
+        version,
+    )
+    .await?;
+    if usd_price_36.is_zero() {
+        return Ok(Some(0.0));
+    }
+
+    let token: Address = token_address
+        .parse()
+        .with_context(|| format!("Invalid token address for market cap: {token_address}"))?;
+
+    let erc20 = IERC20Approve::new(token, &provider);
+    let total_supply_raw = erc20
+        .totalSupply()
+        .call()
+        .await
+        .with_context(|| format!("Failed totalSupply() for token {token_address}"))?;
+
+    Ok(usd_value_from_oracle_price_36(
+        total_supply_raw,
+        token_decimals,
+        usd_price_36,
+    ))
+}
+
+async fn fetch_oracle_usd_price_36<P>(
+    provider: &P,
+    oracle_address: Address,
+    token_address: &str,
+    pair_address: &str,
+    version: u8,
+) -> Result<U256>
+where
+    P: Provider,
+{
+
     let token: Address = token_address
         .parse()
         .with_context(|| format!("Invalid trigger token address: {token_address}"))?;
@@ -2243,7 +2383,7 @@ async fn fetch_buy_amount_usd_from_oracle(
         .parse()
         .with_context(|| format!("Invalid pair address: {pair_address}"))?;
 
-    let oracle = IPriceGetterV3::new(oracle_address, &provider);
+    let oracle = IPriceGetterV3::new(oracle_address, provider);
     let quote = oracle
         .getUsdPrice(token, pair, version)
         .call()
@@ -2254,11 +2394,7 @@ async fn fetch_buy_amount_usd_from_oracle(
             )
         })?;
 
-    Ok(usd_value_from_oracle_price_36(
-        amount_raw,
-        token_decimals,
-        quote,
-    ))
+    Ok(quote)
 }
 
 #[cfg(test)]

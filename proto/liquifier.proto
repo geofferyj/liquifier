@@ -131,6 +131,7 @@ message CreateSessionRequest {
   double            min_buy_trigger_usd   = 14;
   string            swap_path_json        = 15; // selected path as JSON
   repeated PoolInfo pools                 = 16; // discovered pools to watch
+  double            min_market_cap_usd    = 17;
 }
 
 message GetSessionRequest {
@@ -171,6 +172,7 @@ message SessionInfo {
   string            swap_path_json         = 18;
   string            public_slug            = 19;
   bool              public_sharing_enabled = 23;
+  double            min_market_cap_usd     = 24;
   string            created_at             = 20;
   string            updated_at             = 21;
   repeated PoolInfo pools                  = 22; // pools associated with this session
@@ -282,6 +284,7 @@ message TradeCompletedEvent {
   string tx_hash          = 6;
   uint32 price_impact_bps = 7;
   string executed_at      = 8;
+  string market_cap_usd   = 9;
 }
 
 message PushAck {
@@ -297,6 +300,7 @@ message UpdateSessionConfigRequest {
   double pov_percent         = 2;
   double max_price_impact    = 3;
   double min_buy_trigger_usd = 4;
+  double min_market_cap_usd  = 5;
 }
 
 message TogglePublicSharingRequest {

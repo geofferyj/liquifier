@@ -48,6 +48,7 @@ interface WizardState {
   povPercent: number;
   maxPriceImpact: number;
   minBuyTriggerUsd: number;
+  minMarketCapUsd: number;
   // Pool discovery & selection — lives in step 1
   discoveredPools: PoolInfo[];
   selectedPoolAddresses: Set<string>;
@@ -68,6 +69,7 @@ const INITIAL_STATE: WizardState = {
   povPercent: 10,
   maxPriceImpact: 1.0,
   minBuyTriggerUsd: 100,
+  minMarketCapUsd: 50_000_000,
   discoveredPools: [],
   selectedPoolAddresses: new Set(),
   poolPaths: {},
@@ -436,6 +438,7 @@ export default function SessionCreatePage() {
         pov_percent: form.povPercent,
         max_price_impact: form.maxPriceImpact,
         min_buy_trigger_usd: form.minBuyTriggerUsd,
+        min_market_cap_usd: form.minMarketCapUsd,
         // Session-level swap path is not used; routing is per-pool
         swap_path_json: undefined,
         pools: selectedPools,
@@ -560,15 +563,15 @@ export default function SessionCreatePage() {
                   <option value="">Select wallet...</option>
                   {role === "admin"
                     ? adminWallets.map((w) => (
-                        <option key={w.wallet_id} value={w.wallet_id}>
-                          {w.owner_name} — {w.address}
-                        </option>
-                      ))
+                      <option key={w.wallet_id} value={w.wallet_id}>
+                        {w.owner_name} — {w.address}
+                      </option>
+                    ))
                     : wallets.map((w) => (
-                        <option key={w.wallet_id} value={w.wallet_id}>
-                          {w.address}
-                        </option>
-                      ))}
+                      <option key={w.wallet_id} value={w.wallet_id}>
+                        {w.address}
+                      </option>
+                    ))}
                 </select>
               )}
             </div>
@@ -725,6 +728,24 @@ export default function SessionCreatePage() {
                 />
                 <p className="text-xs text-muted-foreground mt-1">
                   Only react to buy events larger than this USD value.
+                </p>
+              </div>
+
+              <div>
+                <label className="text-sm text-muted-foreground mb-1 block">
+                  Minimum Market Cap (USD)
+                </label>
+                <Input
+                  type="number"
+                  step="1"
+                  min="0"
+                  value={form.minMarketCapUsd}
+                  onChange={(e) =>
+                    update({ minMarketCapUsd: parseFloat(e.target.value) || 0 })
+                  }
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Skip sells when token market cap falls below this value at execution time.
                 </p>
               </div>
             </div>
@@ -965,6 +986,9 @@ export default function SessionCreatePage() {
 
               <div className="text-muted-foreground">Min Buy Trigger</div>
               <div className="font-mono">${form.minBuyTriggerUsd}</div>
+
+              <div className="text-muted-foreground">Min Market Cap</div>
+              <div className="font-mono">${form.minMarketCapUsd}</div>
 
               <div className="text-muted-foreground">Monitored Pools</div>
               <div className="font-mono">

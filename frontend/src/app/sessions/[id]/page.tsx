@@ -90,9 +90,10 @@ export default function SessionDashboardPage() {
   const [editPov, setEditPov] = useState(0);
   const [editMaxImpact, setEditMaxImpact] = useState(0);
   const [editMinTrigger, setEditMinTrigger] = useState(0);
+  const [editMinMarketCap, setEditMinMarketCap] = useState(0);
 
   const configMutation = useMutation({
-    mutationFn: (config: { pov_percent: number; max_price_impact: number; min_buy_trigger_usd: number }) =>
+    mutationFn: (config: { pov_percent: number; max_price_impact: number; min_buy_trigger_usd: number; min_market_cap_usd: number }) =>
       api.updateSessionConfig(sessionId, config),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
@@ -498,6 +499,7 @@ export default function SessionDashboardPage() {
                 setEditPov(session.pov_percent);
                 setEditMaxImpact(session.max_price_impact);
                 setEditMinTrigger(session.min_buy_trigger_usd);
+                setEditMinMarketCap(session.min_market_cap_usd);
                 setEditingConfig(true);
               }}
             >
@@ -508,7 +510,7 @@ export default function SessionDashboardPage() {
         <CardContent>
           {editingConfig ? (
             <div className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
                   <label className="text-sm text-muted-foreground">POV %</label>
                   <Input
@@ -536,6 +538,16 @@ export default function SessionDashboardPage() {
                     onChange={(e) => setEditMinTrigger(parseFloat(e.target.value) || 0)}
                   />
                 </div>
+                <div>
+                  <label className="text-sm text-muted-foreground">Min Market Cap (USD)</label>
+                  <Input
+                    type="number"
+                    step="1"
+                    min="0"
+                    value={editMinMarketCap}
+                    onChange={(e) => setEditMinMarketCap(parseFloat(e.target.value) || 0)}
+                  />
+                </div>
               </div>
               <div className="flex gap-2">
                 <Button
@@ -545,6 +557,7 @@ export default function SessionDashboardPage() {
                       pov_percent: editPov,
                       max_price_impact: editMaxImpact,
                       min_buy_trigger_usd: editMinTrigger,
+                      min_market_cap_usd: editMinMarketCap,
                     })
                   }
                   disabled={configMutation.isPending}
@@ -557,7 +570,7 @@ export default function SessionDashboardPage() {
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
               <div>
                 <span className="text-muted-foreground">Strategy</span>
                 <p className="font-mono">POV ({session.pov_percent}%)</p>
@@ -569,6 +582,10 @@ export default function SessionDashboardPage() {
               <div>
                 <span className="text-muted-foreground">Min Trigger</span>
                 <p className="font-mono">${session.min_buy_trigger_usd}</p>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Min Market Cap</span>
+                <p className="font-mono">${session.min_market_cap_usd}</p>
               </div>
               <div>
                 <span className="text-muted-foreground">Public Link</span>
@@ -755,6 +772,7 @@ export default function SessionDashboardPage() {
                     <th className="text-right py-2 font-medium">Sold</th>
                     <th className="text-right py-2 font-medium">Received</th>
                     <th className="text-right py-2 font-medium">Impact</th>
+                    <th className="text-right py-2 font-medium">MCap</th>
                     <th className="text-right py-2 font-medium">Tx</th>
                   </tr>
                 </thead>
@@ -781,6 +799,11 @@ export default function SessionDashboardPage() {
                       </td>
                       <td className="text-right font-mono">
                         {(trade.price_impact_bps / 100).toFixed(2)}%
+                      </td>
+                      <td className="text-right font-mono text-xs">
+                        {trade.market_cap_usd
+                          ? formatUsd(Number.parseFloat(trade.market_cap_usd))
+                          : "—"}
                       </td>
                       <td className="text-right">
                         <a

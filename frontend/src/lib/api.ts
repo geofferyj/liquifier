@@ -235,6 +235,7 @@ class ApiClient {
     pov_percent: number;
     max_price_impact: number;
     min_buy_trigger_usd: number;
+    min_market_cap_usd: number;
     swap_path_json?: string;
     pools?: PoolInfo[];
   }): Promise<Session> {
@@ -317,6 +318,7 @@ class ApiClient {
       pov_percent?: number;
       max_price_impact?: number;
       min_buy_trigger_usd?: number;
+      min_market_cap_usd?: number;
     },
   ): Promise<Session> {
     return this.request(`/api/v1/sessions/${sessionId}/config`, {

@@ -89,6 +89,12 @@ function normalizeWsMessage(raw: unknown): WsMessage | null {
         typeof value.received_amount === "string" ? value.received_amount : "0",
       tx_hash: typeof value.tx_hash === "string" ? value.tx_hash : "",
       price_impact_bps: Number.isFinite(parsedImpact) ? parsedImpact : 0,
+      market_cap_usd:
+        typeof value.market_cap_usd === "string"
+          ? value.market_cap_usd
+          : value.market_cap_usd === null
+            ? null
+            : undefined,
       failure_reason:
         typeof value.failure_reason === "string"
           ? value.failure_reason
@@ -133,6 +139,12 @@ function normalizeWsMessage(raw: unknown): WsMessage | null {
             ? value.trigger_tx
             : "",
       price_impact_bps: Number.isFinite(parsedImpact) ? parsedImpact : 0,
+      market_cap_usd:
+        typeof value.market_cap_usd === "string"
+          ? value.market_cap_usd
+          : value.market_cap_usd === null
+            ? null
+            : undefined,
       failure_reason:
         typeof value.failure_reason === "string"
           ? value.failure_reason

@@ -105,6 +105,7 @@ export interface Session {
   pov_percent: number;
   max_price_impact: number;
   min_buy_trigger_usd: number;
+  min_market_cap_usd: number;
   swap_path_json: string;
   public_slug: string;
   public_sharing_enabled: boolean;
@@ -122,6 +123,7 @@ export interface Trade {
   received_amount: string;
   tx_hash: string;
   price_impact_bps: number;
+  market_cap_usd?: string | null;
   failure_reason?: string | null;
   executed_at: string;
 }
@@ -153,6 +155,7 @@ export interface WsTradeCompleted {
   received_amount: string;
   tx_hash: string;
   price_impact_bps: number;
+  market_cap_usd?: string | null;
   failure_reason?: string | null;
   executed_at: string;
 }

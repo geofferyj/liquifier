@@ -110,6 +110,8 @@ CREATE TABLE sessions (
     min_buy_trigger_usd NUMERIC(18, 2) NOT NULL DEFAULT 100.00,
     -- Chosen path (JSON array of pool hops)
     swap_path JSONB,
+    -- minimum token market cap required at execution time
+    min_market_cap_usd NUMERIC(30, 2) NOT NULL DEFAULT 50000000.00,
     -- Public sharing
     public_slug TEXT UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -153,6 +155,8 @@ CREATE TABLE trades (
     -- basis points
     -- Routing (if intermediate swap needed)
     route_tx_hash TEXT,
+    market_cap_usd NUMERIC(30, 2),
+    -- token market cap snapshot at execution time
     final_received NUMERIC(78, 0),
     final_token TEXT,
     -- Gas

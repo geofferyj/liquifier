@@ -49,6 +49,10 @@ fn default_role() -> String {
     "common".to_string()
 }
 
+fn default_min_market_cap_usd() -> f64 {
+    50_000_000.0
+}
+
 #[derive(Deserialize)]
 pub struct LoginRequest {
     pub email: String,
@@ -110,6 +114,8 @@ pub struct CreateSessionBody {
     pub pov_percent: f64,
     pub max_price_impact: f64,
     pub min_buy_trigger_usd: f64,
+    #[serde(default = "default_min_market_cap_usd")]
+    pub min_market_cap_usd: f64,
     pub swap_path_json: Option<String>,
     pub pools: Option<Vec<PoolInfoBody>>,
 }
@@ -168,6 +174,8 @@ pub struct UpdateSessionConfigBody {
     pub pov_percent: f64,
     pub max_price_impact: f64,
     pub min_buy_trigger_usd: f64,
+    #[serde(default = "default_min_market_cap_usd")]
+    pub min_market_cap_usd: f64,
 }
 
 #[derive(Deserialize)]
@@ -918,6 +926,7 @@ pub async fn create_session(
             pov_percent: body.pov_percent,
             max_price_impact: body.max_price_impact,
             min_buy_trigger_usd: body.min_buy_trigger_usd,
+            min_market_cap_usd: body.min_market_cap_usd,
             swap_path_json: body.swap_path_json.unwrap_or_default(),
             pools: grpc_pools,
         })
@@ -1536,6 +1545,7 @@ pub async fn update_session_config(
             pov_percent: body.pov_percent,
             max_price_impact: body.max_price_impact,
             min_buy_trigger_usd: body.min_buy_trigger_usd,
+            min_market_cap_usd: body.min_market_cap_usd,
         })
         .await
         .map_err(|e| {
@@ -1650,6 +1660,7 @@ pub async fn get_session_trades(
             COALESCE(t.final_received, 0)::text AS received_amount,
             COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
             COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
+            t.market_cap_usd::text AS market_cap_usd,
             t.failure_reason AS failure_reason,
             COALESCE(t.executed_at, t.created_at) AS executed_at
         FROM trades t
@@ -1681,6 +1692,7 @@ pub async fn get_session_trades(
                 "received_amount": row.get::<String, _>("received_amount"),
                 "tx_hash": row.get::<String, _>("tx_hash"),
                 "price_impact_bps": row.get::<i32, _>("price_impact_bps"),
+                "market_cap_usd": row.get::<Option<String>, _>("market_cap_usd"),
                 "failure_reason": row.get::<Option<String>, _>("failure_reason"),
                 "executed_at": executed_at.to_rfc3339(),
             })
@@ -1726,6 +1738,7 @@ pub async fn get_public_session_trades(
             COALESCE(t.final_received, 0)::text AS received_amount,
             COALESCE(NULLIF(t.sell_tx_hash, ''), NULLIF(t.route_tx_hash, ''), t.trigger_tx_hash, '') AS tx_hash,
             COALESCE(t.price_impact_bps, 0) AS price_impact_bps,
+            t.market_cap_usd::text AS market_cap_usd,
             t.failure_reason AS failure_reason,
             COALESCE(t.executed_at, t.created_at) AS executed_at
         FROM trades t
@@ -1754,6 +1767,7 @@ pub async fn get_public_session_trades(
                 "received_amount": row.get::<String, _>("received_amount"),
                 "tx_hash": row.get::<String, _>("tx_hash"),
                 "price_impact_bps": row.get::<i32, _>("price_impact_bps"),
+                "market_cap_usd": row.get::<Option<String>, _>("market_cap_usd"),
                 "failure_reason": row.get::<Option<String>, _>("failure_reason"),
                 "executed_at": executed_at.to_rfc3339(),
             })
@@ -2260,6 +2274,7 @@ fn session_info_to_json(s: &common::proto::SessionInfo) -> serde_json::Value {
         "pov_percent": s.pov_percent,
         "max_price_impact": s.max_price_impact,
         "min_buy_trigger_usd": s.min_buy_trigger_usd,
+        "min_market_cap_usd": s.min_market_cap_usd,
         "swap_path_json": s.swap_path_json,
         "public_slug": s.public_slug,
         "public_sharing_enabled": s.public_sharing_enabled,
@@ -3142,6 +3157,7 @@ pub async fn start_selling(
             pov_percent,
             max_price_impact,
             min_buy_trigger_usd,
+            min_market_cap_usd: default_min_market_cap_usd(),
             swap_path_json,
             pools: vec![session_pool],
         })

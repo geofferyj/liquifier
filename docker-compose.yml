@@ -87,6 +87,7 @@ services:
       APP__APPLICATION__ENVIRONMENT: ${APP__APPLICATION__ENVIRONMENT:-production}
       APP__SMTP__BASE_URL: ${APP__SMTP__BASE_URL:-https://liquifier.penitools.com}
       APP__API_GATEWAY__CORS_ALLOWED_ORIGIN: ${APP__API_GATEWAY__CORS_ALLOWED_ORIGIN:-https://liquifier.penitools.com}
+      RUN_DB_MIGRATIONS: "false"
       RUST_LOG: info,api_gateway=debug
 
   # ──────────────────────────────────────────────────────────────

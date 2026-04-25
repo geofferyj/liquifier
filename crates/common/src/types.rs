@@ -50,6 +50,7 @@ pub struct TradeCompletedEvent {
     pub received_amount: String,
     pub tx_hash: String,
     pub price_impact_bps: Option<f64>,
+    pub market_cap_usd: Option<String>,
     pub executed_at: Option<String>,
     pub status: String,
     pub failure_reason: Option<String>,

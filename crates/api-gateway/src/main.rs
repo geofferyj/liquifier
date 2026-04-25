@@ -11,6 +11,7 @@ use common::types::{
 use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -67,10 +68,18 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to connect to PostgreSQL")?;
 
-    sqlx::migrate!("../../migrations")
-        .run(&db)
-        .await
-        .context("Failed to run database migrations")?;
+    let run_startup_migrations = env::var("RUN_DB_MIGRATIONS")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+
+    if run_startup_migrations {
+        sqlx::migrate!("../../migrations")
+            .run(&db)
+            .await
+            .context("Failed to run database migrations")?;
+    } else {
+        info!("Skipping embedded database migrations; relying on external migration runner");
+    }
 
     // Seed admin user from env config on first start
     seed_admin_user(&db, &cfg.auth).await?;

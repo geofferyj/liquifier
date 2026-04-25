@@ -83,6 +83,7 @@ impl MetricsService for MetricsServiceImpl {
             "received_amount": event.received_amount,
             "tx_hash": event.tx_hash,
             "price_impact_bps": event.price_impact_bps,
+            "market_cap_usd": event.market_cap_usd,
             "executed_at": event.executed_at,
         }))
         .unwrap_or_default();

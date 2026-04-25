@@ -98,6 +98,7 @@ export const useLiveDataStore = create<LiveDataState>((set) => ({
           received_amount: msg.received_amount,
           tx_hash: msg.tx_hash,
           price_impact_bps: msg.price_impact_bps,
+          market_cap_usd: msg.market_cap_usd,
           failure_reason: msg.failure_reason,
           executed_at: msg.executed_at,
         };

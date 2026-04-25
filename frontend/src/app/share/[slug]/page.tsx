@@ -305,6 +305,7 @@ export default function PublicSessionPage() {
                     <th className="text-left py-2 font-medium">Time</th>
                     <th className="text-right py-2 font-medium">Amount</th>
                     <th className="text-right py-2 font-medium">Impact</th>
+                    <th className="text-right py-2 font-medium">MCap</th>
                     <th className="text-right py-2 font-medium">Tx</th>
                   </tr>
                 </thead>
@@ -325,6 +326,11 @@ export default function PublicSessionPage() {
                       </td>
                       <td className="text-right font-mono">
                         {(trade.price_impact_bps / 100).toFixed(2)}%
+                      </td>
+                      <td className="text-right font-mono text-xs">
+                        {trade.market_cap_usd
+                          ? formatUsd(Number.parseFloat(trade.market_cap_usd))
+                          : "—"}
                       </td>
                       <td className="text-right">
                         <a
