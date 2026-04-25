@@ -413,7 +413,7 @@ async fn process_swap_event(state: &EngineState, event: DexSwapEvent) -> Result<
         }
 
         // 2b. Market-cap snapshot + optional guard at execution time.
-        // Uses on-chain totalSupply and oracle USD price for the sell token.
+        // Uses on-chain circulating supply (totalSupply - known burn sinks) and oracle USD price.
         let market_cap_usd = match fetch_token_market_cap_usd_from_oracle(
             &session.chain,
             state.buy_trigger_oracle,
@@ -2358,11 +2358,41 @@ async fn fetch_token_market_cap_usd_from_oracle(
         .await
         .with_context(|| format!("Failed totalSupply() for token {token_address}"))?;
 
+    let mut burned_supply_raw = U256::ZERO;
+    for burn_address in known_burn_addresses() {
+        match erc20.balanceOf(burn_address).call().await {
+            Ok(balance) => {
+                burned_supply_raw = burned_supply_raw.saturating_add(balance);
+            }
+            Err(e) => {
+                warn!(
+                    token = %token_address,
+                    burn_address = %burn_address,
+                    error = %e,
+                    "Failed to fetch burn-address balance; treating as zero"
+                );
+            }
+        }
+    }
+
+    let circulating_supply_raw = total_supply_raw.saturating_sub(burned_supply_raw);
+
     Ok(usd_value_from_oracle_price_36(
-        total_supply_raw,
+        circulating_supply_raw,
         token_decimals,
         usd_price_36,
     ))
+}
+
+fn known_burn_addresses() -> Vec<Address> {
+    [
+        "0x0000000000000000000000000000000000000000",
+        "0x000000000000000000000000000000000000dEaD",
+        "0xdead000000000000000042069420694206942069",
+    ]
+    .iter()
+    .filter_map(|value| value.parse().ok())
+    .collect()
 }
 
 async fn fetch_oracle_usd_price_36<P>(
