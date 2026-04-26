@@ -34,6 +34,8 @@ import {
 import { CopyableAddress } from "@/components/ui/copyable-address";
 import type { Session, SessionStatus } from "@/lib/types";
 
+const TRADES_PAGE_SIZE = 15;
+
 export default function SessionDashboardPage() {
   const router = useRouter();
   const params = useParams<{ id: string }>();
@@ -91,6 +93,7 @@ export default function SessionDashboardPage() {
   const [editMaxImpact, setEditMaxImpact] = useState(0);
   const [editMinTrigger, setEditMinTrigger] = useState(0);
   const [editMinMarketCap, setEditMinMarketCap] = useState(0);
+  const [tradesPage, setTradesPage] = useState(1);
 
   const configMutation = useMutation({
     mutationFn: (config: { pov_percent: number; max_price_impact: number; min_buy_trigger_usd: number; min_market_cap_usd: number }) =>
@@ -109,6 +112,30 @@ export default function SessionDashboardPage() {
   });
 
   const session = sessionQuery.data;
+
+  const recentTrades =
+    (liveData?.recentTrades.length ?? 0) > 0
+      ? liveData?.recentTrades ?? []
+      : sessionTradesQuery.data?.trades ?? [];
+
+  const totalTradePages = Math.max(1, Math.ceil(recentTrades.length / TRADES_PAGE_SIZE));
+  const safeTradesPage = Math.min(tradesPage, totalTradePages);
+  const tradePageStart = (safeTradesPage - 1) * TRADES_PAGE_SIZE;
+  const paginatedRecentTrades = recentTrades.slice(
+    tradePageStart,
+    tradePageStart + TRADES_PAGE_SIZE,
+  );
+  const tradePageEnd = tradePageStart + paginatedRecentTrades.length;
+
+  useEffect(() => {
+    setTradesPage(1);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (tradesPage > totalTradePages) {
+      setTradesPage(totalTradePages);
+    }
+  }, [tradesPage, totalTradePages]);
 
   const sellTokenUsdPriceQuery = useQuery({
     queryKey: ["token-usd-price", session?.chain, session?.sell_token],
@@ -174,11 +201,6 @@ export default function SessionDashboardPage() {
       BigInt(session.total_amount) - BigInt(session.amount_sold)
     ).toString();
   const convertedUsd = liveData?.convertedValueUsd ?? "0.00";
-  const recentTrades =
-    (liveData?.recentTrades.length ?? 0) > 0
-      ? liveData?.recentTrades ?? []
-      : sessionTradesQuery.data?.trades ?? [];
-
   const sellTokenUsdPrice = sellTokenUsdPriceQuery.data?.usd_price;
   const targetTokenUsdPrice = targetTokenUsdPriceQuery.data?.usd_price;
 
@@ -585,7 +607,9 @@ export default function SessionDashboardPage() {
               </div>
               <div>
                 <span className="text-muted-foreground">Min Market Cap</span>
-                <p className="font-mono">${session.min_market_cap_usd}</p>
+                <p className="font-mono">
+                  ${Number(session.min_market_cap_usd).toLocaleString("en-US")}
+                </p>
               </div>
               <div>
                 <span className="text-muted-foreground">Public Link</span>
@@ -777,7 +801,7 @@ export default function SessionDashboardPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {recentTrades.slice(0, 15).map((trade) => (
+                  {paginatedRecentTrades.map((trade) => (
                     <tr
                       key={trade.trade_id}
                       className="border-b border-border/50 hover:bg-secondary/30 transition-colors"
@@ -819,6 +843,35 @@ export default function SessionDashboardPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {recentTrades.length > 0 && (
+            <div className="mt-4 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span>
+                Showing {tradePageStart + 1}-{tradePageEnd} of {recentTrades.length}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setTradesPage((prev) => Math.max(1, prev - 1))}
+                  disabled={safeTradesPage <= 1}
+                >
+                  Previous
+                </Button>
+                <span className="font-mono">
+                  Page {safeTradesPage} / {totalTradePages}
+                </span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setTradesPage((prev) => Math.min(totalTradePages, prev + 1))}
+                  disabled={safeTradesPage >= totalTradePages}
+                >
+                  Next
+                </Button>
+              </div>
             </div>
           )}
         </CardContent>

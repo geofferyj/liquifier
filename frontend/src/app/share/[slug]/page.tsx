@@ -1,11 +1,12 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { useSessionSocket } from "@/hooks/useSessionSocket";
 import { useLiveDataStore } from "@/lib/store";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   AreaChart,
@@ -19,9 +20,12 @@ import {
 import { cn, formatTokenAmount, formatTokenAmountCompact, shortenTxHash, tokenAmountToUsd, formatUsd } from "@/lib/utils";
 import type { SessionStatus } from "@/lib/types";
 
+const TRADES_PAGE_SIZE = 10;
+
 export default function PublicSessionPage() {
   const params = useParams<{ slug: string }>();
   const slug = params.slug;
+  const [tradesPage, setTradesPage] = useState(1);
 
   // Fetch initial session data via public REST endpoint
   const sessionQuery = useQuery({
@@ -86,6 +90,30 @@ export default function PublicSessionPage() {
     sessionTradesQuery.data,
   ]);
 
+  const recentTrades =
+    (liveData?.recentTrades.length ?? 0) > 0
+      ? liveData?.recentTrades ?? []
+      : sessionTradesQuery.data ?? [];
+
+  const totalTradePages = Math.max(1, Math.ceil(recentTrades.length / TRADES_PAGE_SIZE));
+  const safeTradesPage = Math.min(tradesPage, totalTradePages);
+  const tradePageStart = (safeTradesPage - 1) * TRADES_PAGE_SIZE;
+  const paginatedRecentTrades = recentTrades.slice(
+    tradePageStart,
+    tradePageStart + TRADES_PAGE_SIZE,
+  );
+  const tradePageEnd = tradePageStart + paginatedRecentTrades.length;
+
+  useEffect(() => {
+    setTradesPage(1);
+  }, [slug]);
+
+  useEffect(() => {
+    if (tradesPage > totalTradePages) {
+      setTradesPage(totalTradePages);
+    }
+  }, [tradesPage, totalTradePages]);
+
   if (sessionQuery.isLoading) {
     return (
       <main className="min-h-screen flex items-center justify-center">
@@ -113,10 +141,6 @@ export default function PublicSessionPage() {
     liveData?.remaining ??
     (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString();
   const convertedUsd = liveData?.convertedValueUsd ?? "0.00";
-  const recentTrades =
-    (liveData?.recentTrades.length ?? 0) > 0
-      ? liveData?.recentTrades ?? []
-      : sessionTradesQuery.data ?? [];
   const chartData = recentTrades
     .slice(0, 20)
     .reverse()
@@ -310,7 +334,7 @@ export default function PublicSessionPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {recentTrades.slice(0, 10).map((trade) => (
+                  {paginatedRecentTrades.map((trade) => (
                     <tr
                       key={trade.trade_id}
                       className="border-b border-border/50"
@@ -346,6 +370,35 @@ export default function PublicSessionPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {recentTrades.length > 0 && (
+            <div className="mt-4 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span>
+                Showing {tradePageStart + 1}-{tradePageEnd} of {recentTrades.length}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setTradesPage((prev) => Math.max(1, prev - 1))}
+                  disabled={safeTradesPage <= 1}
+                >
+                  Previous
+                </Button>
+                <span className="font-mono">
+                  Page {safeTradesPage} / {totalTradePages}
+                </span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setTradesPage((prev) => Math.min(totalTradePages, prev + 1))}
+                  disabled={safeTradesPage >= totalTradePages}
+                >
+                  Next
+                </Button>
+              </div>
             </div>
           )}
         </CardContent>
