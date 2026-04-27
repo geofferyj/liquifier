@@ -59,7 +59,7 @@ export default function PublicSessionPage() {
   const sessionTradesQuery = useQuery({
     queryKey: ["public-session-trades", slug],
     queryFn: async () => {
-      const resp = await api.getSessionTradesBySlug(slug, 50);
+      const resp = await api.getSessionTradesBySlug(slug, 1000);
       return resp.trades;
     },
     enabled: !!session,
@@ -90,19 +90,23 @@ export default function PublicSessionPage() {
     sessionTradesQuery.data,
   ]);
 
-  const recentTrades =
+  // Use all trades from state or API, but paginate for display
+  const allRecentTrades =
     (liveData?.recentTrades.length ?? 0) > 0
       ? liveData?.recentTrades ?? []
       : sessionTradesQuery.data ?? [];
 
-  const totalTradePages = Math.max(1, Math.ceil(recentTrades.length / TRADES_PAGE_SIZE));
+  const totalTradePages = Math.max(1, Math.ceil(allRecentTrades.length / TRADES_PAGE_SIZE));
   const safeTradesPage = Math.min(tradesPage, totalTradePages);
   const tradePageStart = (safeTradesPage - 1) * TRADES_PAGE_SIZE;
-  const paginatedRecentTrades = recentTrades.slice(
+  const paginatedRecentTrades = allRecentTrades.slice(
     tradePageStart,
     tradePageStart + TRADES_PAGE_SIZE,
   );
   const tradePageEnd = tradePageStart + paginatedRecentTrades.length;
+
+  // Expose all recent trades for summary calculation
+  const recentTrades = allRecentTrades;
 
   useEffect(() => {
     setTradesPage(1);
@@ -141,7 +145,7 @@ export default function PublicSessionPage() {
     liveData?.remaining ??
     (BigInt(session.total_amount) - BigInt(session.amount_sold)).toString();
   const convertedUsd = liveData?.convertedValueUsd ?? "0.00";
-  const chartData = recentTrades
+  const chartData = allRecentTrades
     .slice(0, 20)
     .reverse()
     .map((t, i) => ({

@@ -60,10 +60,10 @@ export default function SessionDashboardPage() {
   const liveData = useLiveDataStore((s) => s.sessions[sessionId]);
   const seedSession = useLiveDataStore((s) => s.seedSession);
 
-  // Fetch recent trades for first-load hydration.
+  // Fetch all trades for first-load hydration.
   const sessionTradesQuery = useQuery({
     queryKey: ["session-trades", sessionId],
-    queryFn: () => api.getSessionTrades(sessionId, 50),
+    queryFn: () => api.getSessionTrades(sessionId, 1000),
     enabled: !!sessionId,
     refetchInterval: 15_000,
   });
@@ -113,19 +113,23 @@ export default function SessionDashboardPage() {
 
   const session = sessionQuery.data;
 
-  const recentTrades =
+  // Use all trades from state or API, but paginate for display
+  const allRecentTrades =
     (liveData?.recentTrades.length ?? 0) > 0
       ? liveData?.recentTrades ?? []
       : sessionTradesQuery.data?.trades ?? [];
 
-  const totalTradePages = Math.max(1, Math.ceil(recentTrades.length / TRADES_PAGE_SIZE));
+  const totalTradePages = Math.max(1, Math.ceil(allRecentTrades.length / TRADES_PAGE_SIZE));
   const safeTradesPage = Math.min(tradesPage, totalTradePages);
   const tradePageStart = (safeTradesPage - 1) * TRADES_PAGE_SIZE;
-  const paginatedRecentTrades = recentTrades.slice(
+  const paginatedRecentTrades = allRecentTrades.slice(
     tradePageStart,
     tradePageStart + TRADES_PAGE_SIZE,
   );
   const tradePageEnd = tradePageStart + paginatedRecentTrades.length;
+
+  // Expose all recent trades for summary calculation
+  const recentTrades = allRecentTrades;
 
   useEffect(() => {
     setTradesPage(1);
@@ -214,8 +218,8 @@ export default function SessionDashboardPage() {
   const remainingUsd = sellTokenUsdPrice ? tokenAmountToUsd(remaining, session.sell_token_decimals, sellTokenUsdPrice) : null;
   const convertedAmountUsd = targetTokenUsdPrice ? tokenAmountToUsd(convertedAmount, session.target_token_decimals, targetTokenUsdPrice) : null;
 
-  // Build chart data from recent trades
-  const chartData = recentTrades
+  // Build chart data from all trades (show last 20 chronologically)
+  const chartData = allRecentTrades
     .slice(0, 20)
     .reverse()
     .map((t, i) => ({

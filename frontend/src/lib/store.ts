@@ -103,9 +103,44 @@ export const useLiveDataStore = create<LiveDataState>((set) => ({
           executed_at: msg.executed_at,
         };
 
+        const dedupedTrades = existing.recentTrades.filter(
+          (item) => item.trade_id !== trade.trade_id,
+        );
+        const isDuplicateTrade = dedupedTrades.length !== existing.recentTrades.length;
+
+        const nextAmountSold = (() => {
+          if (isDuplicateTrade) {
+            return existing.amountSold;
+          }
+          try {
+            return (
+              BigInt(existing.amountSold || "0") + BigInt(trade.sell_amount || "0")
+            ).toString();
+          } catch {
+            return existing.amountSold;
+          }
+        })();
+
+        const nextRemaining = (() => {
+          if (isDuplicateTrade) {
+            return existing.remaining;
+          }
+          try {
+            const currentRemaining = BigInt(existing.remaining || "0");
+            const soldAmount = BigInt(trade.sell_amount || "0");
+            return currentRemaining > soldAmount
+              ? (currentRemaining - soldAmount).toString()
+              : "0";
+          } catch {
+            return existing.remaining;
+          }
+        })();
+
         sessions[msg.session_id] = {
           ...existing,
-          recentTrades: [trade, ...existing.recentTrades].slice(0, 50),
+          amountSold: nextAmountSold,
+          remaining: nextRemaining,
+          recentTrades: [trade, ...dedupedTrades],
         };
       }
 
